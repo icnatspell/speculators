@@ -466,9 +466,30 @@ def _passthrough_pretokenized(
     these rows only need truncation and filtering.
     """
     results: dict[str, list] = {"input_ids": [], "loss_mask": [], "seq_len": []}
+    passthrough_fields = [
+        field
+        for field in (
+            "audio_url",
+            "whisper_begin_index",
+            "id",
+            "speaker_id",
+            "chapter_id",
+            "source_split",
+            "reference_text",
+            "audio_duration_seconds",
+        )
+        if field in examples
+    ]
+    for field in passthrough_fields:
+        results[field] = []
+    if "audio_url" in examples:
+        if "whisper_begin_index" not in examples:
+            raise ValueError("Audio rows require whisper_begin_index")
     num_unsupervised = 0
     num_maybe_truncated = 0
-    for ids, mask in zip(examples["input_ids"], examples["loss_mask"], strict=True):
+    for row_index, (ids, mask) in enumerate(
+        zip(examples["input_ids"], examples["loss_mask"], strict=True)
+    ):
         # A per-row length skew survives strict= column pairing; the collator
         # packs each key independently and would shift the mask silently.
         if len(ids) != len(mask):
@@ -477,6 +498,12 @@ def _passthrough_pretokenized(
                 f"input_ids={len(ids)}, loss_mask={len(mask)}"
             )
         status = _append_row(results, ids, mask, max_length, minimum_valid_tokens)
+        if status == "kept":
+            for field in passthrough_fields:
+                value = examples[field][row_index]
+                if field == "audio_url" and (not isinstance(value, str) or not value):
+                    raise ValueError("Whisper audio_url must be nonempty")
+                results[field].append(value)
         num_unsupervised += status == "unsupervised"
         # Kept-but-truncated only: a row clipped past its boundary reports as
         # unsupervised above, and would otherwise be counted twice.

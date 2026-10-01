@@ -94,6 +94,16 @@ class Qwen3DFlashAttention(nn.Module):
             else None
         )
 
+    def project_context(self, target_hidden, position_embeddings):
+        """Project and rotate verified context once for inference reuse."""
+        bsz, length = target_hidden.shape[:2]
+        key = self.k_proj(target_hidden).view(bsz, length, -1, self.head_dim)
+        key = self.k_norm(key).transpose(1, 2)
+        value = self.v_proj(target_hidden).view(bsz, length, -1, self.head_dim)
+        cos, sin = (item.unsqueeze(1) for item in position_embeddings)
+        key = key * cos + _rotate_half(key) * sin
+        return key, value.transpose(1, 2)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -102,6 +112,8 @@ class Qwen3DFlashAttention(nn.Module):
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
         cache_position: torch.LongTensor | None = None,
+        *,
+        context_key_values: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Instead of computing the k and v matricies from the hidden states,
@@ -113,21 +125,31 @@ class Qwen3DFlashAttention(nn.Module):
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
         # This is the main difference from the usual attention mechanism.
-        k_ctx = self.k_proj(target_hidden)
-        k_noise = self.k_proj(hidden_states)
-        v_ctx = self.v_proj(target_hidden)
-        v_noise = self.v_proj(hidden_states)
-        k = torch.cat([k_ctx, k_noise], dim=1).view(
-            bsz, ctx_len + q_len, -1, self.head_dim
-        )
-        # note the length becomes context length + block size
-        v = torch.cat([v_ctx, v_noise], dim=1).view(
-            bsz, ctx_len + q_len, -1, self.head_dim
-        )
-        k = self.k_norm(k).transpose(1, 2)
-        v = v.transpose(1, 2)
-        cos, sin = position_embeddings
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if context_key_values is None:
+            k_ctx = self.k_proj(target_hidden)
+            k_noise = self.k_proj(hidden_states)
+            v_ctx = self.v_proj(target_hidden)
+            v_noise = self.v_proj(hidden_states)
+            k = torch.cat([k_ctx, k_noise], dim=1).view(
+                bsz, ctx_len + q_len, -1, self.head_dim
+            )
+            v = torch.cat([v_ctx, v_noise], dim=1).view(
+                bsz, ctx_len + q_len, -1, self.head_dim
+            )
+            k = self.k_norm(k).transpose(1, 2)
+            v = v.transpose(1, 2)
+            cos, sin = position_embeddings
+            q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        else:
+            if past_key_values is not None:
+                raise ValueError("Context KV reuse cannot also update a draft cache")
+            k_noise = self.k_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
+            k_noise = self.k_norm(k_noise).transpose(1, 2)
+            v_noise = self.v_proj(hidden_states).view(bsz, q_len, -1, self.head_dim)
+            cos, sin = position_embeddings
+            q, k_noise = apply_rotary_pos_emb(q, k_noise, cos, sin)
+            k = torch.cat([context_key_values[0], k_noise], dim=2)
+            v = torch.cat([context_key_values[1], v_noise.transpose(1, 2)], dim=2)
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)

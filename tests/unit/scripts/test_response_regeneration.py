@@ -215,6 +215,38 @@ def test_pretokenized_rows_pass_through_preprocessing():
     assert "conversations" not in out
 
 
+def test_audio_training_metadata_survives_prepare_data():
+    row = {
+        "input_ids": [[1, 2, 3, 4]],
+        "loss_mask": [[0, 0, 1, 1]],
+        "audio_url": ["file:///tmp/example.flac"],
+        "whisper_begin_index": [2],
+        "id": ["chapter-123-0001"],
+        "speaker_id": [123],
+        "chapter_id": [456],
+        "source_split": ["train.clean.100"],
+        "reference_text": ["A reference transcript."],
+        "audio_duration_seconds": [8.5],
+    }
+    out = _preprocess_batch(
+        row,
+        is_multimodal=False,
+        max_length=16,
+        render_endpoint=None,
+    )
+    for field in (
+        "audio_url",
+        "whisper_begin_index",
+        "id",
+        "speaker_id",
+        "chapter_id",
+        "source_split",
+        "reference_text",
+        "audio_duration_seconds",
+    ):
+        assert out[field][0] == row[field][0]
+
+
 def test_pretokenized_passthrough_truncates_and_filters():
     # Truncation can cut the completion span away (all-zero mask); such a row must
     # be dropped by minimum_valid_tokens, like the tokenized path.
