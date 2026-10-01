@@ -22,6 +22,10 @@ def select_anchors(
     loss_mask: torch.Tensor,  # shape: [1, total_seq_len]
     num_anchors: int,
     block_size: int,
+    *,
+    document_ids: torch.Tensor | None = None,
+    allow_partial_blocks: bool = False,
+    anchors_per_document: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Randomly select anchor positions from valid tokens in sequence.
 
@@ -42,7 +46,14 @@ def select_anchors(
         raise ValueError(f"Expected block size > 0, got {block_size}")
 
     valid_mask = loss_mask.bool().clone()
-    valid_mask[:, -block_size:] = False
+    if allow_partial_blocks:
+        valid_mask[:, -1] = False
+        valid_mask[:, :-1] &= loss_mask[:, 1:].bool()
+        if document_ids is not None:
+            valid_mask[:, :-1] &= document_ids[:, :-1] == document_ids[:, 1:]
+            valid_mask &= document_ids != -1
+    else:
+        valid_mask[:, -block_size:] = False
 
     valid_indices = torch.nonzero(valid_mask.squeeze(0), as_tuple=False).squeeze(
         -1
@@ -57,6 +68,22 @@ def select_anchors(
     # Constrain value of k for torch dynamo
     torch._check(k <= valid_indices.numel())  # noqa: SLF001
     torch._check(k >= 0)  # noqa: SLF001
+
+    if anchors_per_document and document_ids is not None:
+        groups = []
+        for doc in torch.unique(document_ids[0, valid_indices]).tolist():
+            group = valid_indices[document_ids[0, valid_indices] == doc]
+            groups.append(group[torch.randperm(group.numel(), device=device)])
+        interleaved = [
+            group[i : i + 1]
+            for i in range(num_anchors)
+            for group in groups
+            if i < group.numel()
+        ]
+        chosen = torch.cat(interleaved)[:k] if interleaved else valid_indices
+        anchors[:k] = torch.sort(chosen).values
+        anchor_valid[:k] = True
+        return anchors, anchor_valid
 
     perm = torch.randperm(valid_indices.numel(), device=loss_mask.device)
     # Contiguous anchors let flex attention use dense (fast) blocks instead of

@@ -42,9 +42,11 @@ def test_shuffled_dataset_epochs_are_repeatable_and_distinct():
 
 
 def test_reference_error_rates_normalize_case_and_punctuation():
-    rates = corpus_error_rates(["Hello, world!", "One two"], ["hello world", "One too"])
+    rates = corpus_error_rates(
+        ["Hello, world!", "Red blue"], ["hello world", "Red glue"]
+    )
     assert rates["wer"] == pytest.approx(1 / 4)
-    assert rates["cer"] == pytest.approx(1 / 16)
+    assert rates["cer"] == pytest.approx(1 / 17)
 
 
 def test_prefetch_map_overlaps_production_and_preserves_order():
@@ -105,7 +107,10 @@ def test_eal_pools_rounds_and_includes_bonus():
     assert metrics["acceptance_by_position"] == [0.25] * 3
 
 
-def test_online_training_resume_matches_uninterrupted(tmp_path):
+@pytest.mark.parametrize(("batch_size", "accumulation"), [(1, 1), (2, 2)])
+def test_online_training_resume_matches_uninterrupted(
+    tmp_path, batch_size, accumulation
+):
     root = Path(__file__).resolve().parents[2]
     env = {
         **os.environ,
@@ -120,6 +125,12 @@ def test_online_training_resume_matches_uninterrupted(tmp_path):
         "cpu",
         "--steps",
         "6",
+        "--batch-size",
+        str(batch_size),
+        "--gradient-accumulation-steps",
+        str(accumulation),
+        "--bucket-buffer",
+        "8",
         "--max-samples",
         "30",
         "--max-new-tokens",

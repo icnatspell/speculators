@@ -49,6 +49,9 @@ PREPARE_DATA_OVERWRITE_ALLOWED_FILES = {
     "dataset_info.json",
     "state.json",
     "token_freq.pt",
+    "preparation_manifest.json",
+    "prepare_command.txt",
+    "speculators.patch",
 }
 
 
@@ -92,6 +95,9 @@ def prepare_data(
         str,
         typer.Option(help="Directory to save output dataset"),
     ] = "./output",
+    revision: Annotated[
+        str | None, typer.Option(help="Pinned target model revision")
+    ] = None,
     seq_length: Annotated[
         int,
         typer.Option(help="Maximum sequence length for preprocessing and model"),
@@ -236,8 +242,35 @@ def prepare_data(
         allow_empty_output=allow_empty_output,
         trust_remote_code=trust_remote_code,
         skip_token_freq=skip_token_freq,
+        processor_revision=revision,
     )
 
     log.info("Done preparing data")
     log.section(f"Writing dataset to {output}")
     dataset.save_to_disk(output)
+    # Bind indexed rows to their exact inputs and preprocessing configuration.
+    import json  # noqa: PLC0415
+
+    from speculators.provenance import atomic_write  # noqa: PLC0415
+    from speculators.train.whisper_runtime import (  # noqa: PLC0415
+        hash_file,
+        write_provenance,
+    )
+
+    sources = [data] if isinstance(data, str) else data
+    identity = {
+        "model": model,
+        "model_revision": revision,
+        "seq_length": seq_length,
+        "seed": seed,
+        "max_samples": max_samples,
+        "minimum_valid_tokens": minimum_valid_tokens,
+        "dataset_fingerprint": dataset._fingerprint,  # noqa: SLF001 -- HF content identity
+        "sources": {
+            str(path): hash_file(path) for path in sources if Path(path).is_file()
+        },
+    }
+    atomic_write(
+        output_path / "preparation_manifest.json", json.dumps(identity, indent=2)
+    )
+    write_provenance(output_path, "prepare_command.txt")

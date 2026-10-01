@@ -29,6 +29,10 @@ from speculators.train.whisper import (
     save_whisper_draft,
     train_whisper_step,
 )
+from speculators.train.whisper_runtime import (
+    configure_whisper_policy,
+    precision_dtype,
+)
 
 
 def parse_args():
@@ -85,7 +89,7 @@ class UnsupportedAudioError(ValueError):
     """Audio duration outside this short-form training experiment."""
 
 
-def audio_features(row, processor, device):
+def audio_features(row, processor, device, dtype=torch.float32):
     import numpy as np  # noqa: PLC0415
     import soundfile as sf  # noqa: PLC0415
     from scipy.signal import resample_poly  # noqa: PLC0415
@@ -101,7 +105,7 @@ def audio_features(row, processor, device):
         raise UnsupportedAudioError("Audio clip exceeds 30 seconds")
     return processor(
         waveform, sampling_rate=16000, return_tensors="pt"
-    ).input_features.to(device)
+    ).input_features.to(device=device, dtype=dtype)
 
 
 def load_rows(args, split, dataset_sha):
@@ -137,9 +141,19 @@ def load_teacher_and_rows(args, metadata):
         processor = WhisperProcessor.from_pretrained(args.teacher, revision=model_sha)
         teacher_device = getattr(args, "teacher_device", None) or args.device
         teacher = WhisperForConditionalGeneration.from_pretrained(
-            args.teacher, revision=model_sha
+            args.teacher,
+            revision=model_sha,
+            dtype=precision_dtype(
+                getattr(args, "precision", "float32"), teacher_device
+            ),
+            attn_implementation=getattr(args, "teacher_attention", "sdpa"),
         ).to(teacher_device)
-        rows = load_rows(args, args.split, dataset_sha)
+        configure_whisper_policy(teacher, processor)
+        rows = (
+            None
+            if getattr(args, "skip_source_rows", False)
+            else load_rows(args, args.split, dataset_sha)
+        )
     return teacher, processor, rows
 
 

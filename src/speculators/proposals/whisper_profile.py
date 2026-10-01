@@ -9,15 +9,17 @@ import torch
 class WhisperGenerationTimer:
     """Time first-token availability to last-token availability, excluding TTFT."""
 
-    def __init__(self, device, enabled):
+    def __init__(self, device, enabled, extra_devices=()):
+        self.devices = {device, *extra_devices}
         self.device = device
         self.enabled = enabled
         self.start = None
 
     def begin(self):
         if self.enabled and self.start is None:
-            if self.device.type == "cuda":
-                torch.cuda.synchronize(self.device)
+            for device in self.devices:
+                if device.type == "cuda":
+                    torch.cuda.synchronize(device)
             self.start = time.perf_counter()
 
     def finish(self):
@@ -25,8 +27,9 @@ class WhisperGenerationTimer:
             return None
         if self.start is None:
             return 0.0
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+        for device in self.devices:
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
         return time.perf_counter() - self.start
 
 

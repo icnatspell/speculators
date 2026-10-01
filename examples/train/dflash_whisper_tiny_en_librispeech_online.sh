@@ -11,6 +11,7 @@ MAX_SAMPLES="${MAX_SAMPLES:-32}"
 EVAL_SAMPLES="${EVAL_SAMPLES:-8}"
 PREPROCESSING_WORKERS="${PREPROCESSING_WORKERS:-2}"
 TEACHER="${TEACHER:-openai/whisper-tiny.en}"
+TEACHER_REVISION="${TEACHER_REVISION:-87c7102498dcde7456f24cfd30239ca606ed9063}"
 TEACHER_DEVICE="${TEACHER_DEVICE:-cuda}"
 DRAFT_DEVICE="${DRAFT_DEVICE:-$TEACHER_DEVICE}"
 PREFETCH_SAMPLES="${PREFETCH_SAMPLES:-0}"
@@ -26,7 +27,7 @@ TRAIN_OUTPUT="$OUTPUT_DIR/training"
 
 echo "=== Step 1: Generate pinned greedy teacher responses ==="
 "$PYTHON" scripts/generate_whisper_responses.py \
-    --teacher "$TEACHER" \
+    --teacher "$TEACHER" --teacher-revision "$TEACHER_REVISION" \
     --device "$TEACHER_DEVICE" \
     --split train.clean.100 \
     --max-samples "$MAX_SAMPLES" \
@@ -37,18 +38,18 @@ echo "=== Step 1: Generate pinned greedy teacher responses ==="
 
 echo "=== Step 2: Prepare token IDs, masks, and token frequencies ==="
 "$SPECULATORS" prepare-data \
-    --model "$TEACHER" \
+    --model "$TEACHER" --revision "$TEACHER_REVISION" \
     --data "$RESPONSE_FILE" \
     --output "$PREPARED_DIR" \
     --max-samples "$MAX_SAMPLES" \
     --seq-length "$SEQ_LENGTH" \
-    --minimum-valid-tokens 5 \
+    --minimum-valid-tokens 2 \
     --num-preprocessing-workers "$PREPROCESSING_WORKERS" \
     --no-skip-token-freq
 
 echo "=== Step 3: Train the PyTorch drafter and evaluate EAL/speed ==="
 "$PYTHON" scripts/train_whisper_dflash_online.py \
-    --teacher "$TEACHER" \
+    --teacher "$TEACHER" --teacher-revision "$TEACHER_REVISION" \
     --train-data "$PREPARED_DIR" \
     --response-manifest "$RESPONSE_FILE.manifest.json" \
     --split train.clean.100 \
@@ -71,3 +72,8 @@ echo "=== Step 3: Train the PyTorch drafter and evaluate EAL/speed ==="
     --eval-samples "$EVAL_SAMPLES" \
     --eval-repetitions 2 \
     --output-dir "$TRAIN_OUTPUT"
+
+"$PYTHON" scripts/evaluate_whisper_dflash.py \
+    --checkpoint "$TRAIN_OUTPUT/best" --device "$TEACHER_DEVICE" \
+    --split validation.clean --samples "$EVAL_SAMPLES" --repetitions 3 \
+    --output-dir "$OUTPUT_DIR/benchmark"

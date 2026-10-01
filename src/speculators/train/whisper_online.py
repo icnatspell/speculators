@@ -5,10 +5,11 @@ import queue
 import random
 import shutil
 import threading
-import unicodedata
+from contextlib import contextmanager
 from itertools import chain
 
 import torch
+from transformers.models.whisper.english_normalizer import EnglishTextNormalizer
 
 from speculators.provenance import atomic_write
 from speculators.train.whisper import save_whisper_draft
@@ -22,69 +23,110 @@ def learning_rate_scale(step, *, total_steps, warmup_steps, minimum_ratio):
 
 
 def shuffled_dataset_epochs(dataset, *, epochs, seed, buffer_size):
-    """Yield deterministic shuffled passes with an independent order per epoch."""
+    """Globally shuffle indexed rows; avoid split-local buffered shuffle bias."""
+    del buffer_size  # retained for CLI compatibility; indexed data needs no buffer
     return chain.from_iterable(
-        dataset.to_iterable_dataset().shuffle(
-            seed=seed + epoch, buffer_size=buffer_size
-        )
-        for epoch in range(epochs)
+        dataset.shuffle(seed=seed + epoch) for epoch in range(epochs)
     )
 
 
-def prefetch_map(source, function, *, capacity):  # noqa: C901
-    """Map items in order, optionally using a bounded producer thread."""
-    if capacity < 0:
-        raise ValueError("Prefetch capacity cannot be negative")
-    if capacity == 0:
-        for item in source:
-            yield function(item)
-        return
+class PrefetchIterator:
+    """Ordered bounded producer with exclusive, quiescent pause points."""
 
-    output = queue.Queue(maxsize=capacity)
-    stopped = threading.Event()
-    finished = object()
+    def __init__(self, source, function, capacity):
+        if capacity < 0:
+            raise ValueError("Prefetch capacity cannot be negative")
+        self.source = iter(source)
+        self.function = function
+        self.capacity = capacity
+        self.output = queue.Queue(maxsize=max(1, capacity))
+        self.stopped = threading.Event()
+        self.condition = threading.Condition()
+        self.paused = False
+        self.active = False
+        self.worker = None
+        self.finished = object()
 
-    def put(value):
-        while not stopped.is_set():
+    def _put(self, value):
+        while not self.stopped.is_set():
             try:
-                output.put(value, timeout=0.1)
-                return True
+                self.output.put(value, timeout=0.1)
+                return
             except queue.Full:
                 continue
-        return False
 
-    def produce():
+    def _produce(self):
         try:
-            for item in source:
-                if not put(("item", function(item))):
-                    return
+            for item in self.source:
+                with self.condition:
+                    self.condition.wait_for(
+                        lambda: not self.paused or self.stopped.is_set()
+                    )
+                    if self.stopped.is_set():
+                        return
+                    self.active = True
+                try:
+                    value = self.function(item)
+                finally:
+                    with self.condition:
+                        self.active = False
+                        self.condition.notify_all()
+                self._put(("item", value))
         except Exception as error:  # noqa: BLE001 -- relay producer errors
-            put(("error", error))
+            self._put(("error", error))
         finally:
-            put(finished)
+            self._put(self.finished)
 
-    worker = threading.Thread(target=produce, name="whisper-feature-prefetch")
-    worker.start()
-    try:
-        while True:
-            value = output.get()
-            if value is finished:
-                break
-            kind, payload = value
-            if kind == "error":
-                raise payload
-            yield payload
-    finally:
-        stopped.set()
-        worker.join()
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self.capacity:
+            return self.function(next(self.source))
+        if self.worker is None:
+            self.worker = threading.Thread(
+                target=self._produce, name="whisper-feature-prefetch"
+            )
+            self.worker.start()
+        value = self.output.get()
+        if value is self.finished:
+            self.close()
+            raise StopIteration
+        kind, payload = value
+        if kind == "error":
+            self.close()
+            raise payload
+        return payload
+
+    @contextmanager
+    def pause(self):
+        with self.condition:
+            self.paused = True
+            self.condition.wait_for(lambda: not self.active)
+        try:
+            yield
+        finally:
+            with self.condition:
+                self.paused = False
+                self.condition.notify_all()
+
+    def close(self):
+        self.stopped.set()
+        with self.condition:
+            self.condition.notify_all()
+        if self.worker is not None:
+            self.worker.join()
+        while not self.output.empty():
+            self.output.get_nowait()
+
+
+def prefetch_map(source, function, *, capacity):
+    return PrefetchIterator(source, function, capacity)
 
 
 def normalize_transcript(text):
-    chars = [
-        character.lower() if unicodedata.category(character)[0] in {"L", "N"} else " "
-        for character in text
-    ]
-    return " ".join("".join(chars).split())
+
+    return EnglishTextNormalizer({})(text)
 
 
 def edit_distance(reference, hypothesis):
@@ -103,11 +145,11 @@ def edit_distance(reference, hypothesis):
     return previous[-1]
 
 
-def corpus_error_rates(references, hypotheses):
+def corpus_error_rates(references, hypotheses, *, normalizer=normalize_transcript):
     word_errors = word_count = char_errors = char_count = 0
     for reference, hypothesis in zip(references, hypotheses, strict=True):
-        normalized_reference = normalize_transcript(reference)
-        normalized_hypothesis = normalize_transcript(hypothesis)
+        normalized_reference = normalizer(reference)
+        normalized_hypothesis = normalizer(hypothesis)
         reference_words = normalized_reference.split()
         hypothesis_words = normalized_hypothesis.split()
         word_errors += edit_distance(reference_words, hypothesis_words)
@@ -118,6 +160,10 @@ def corpus_error_rates(references, hypotheses):
         char_count += len(reference_chars)
     return {
         "wer": word_errors / word_count if word_count else None,
+        "word_errors": word_errors,
+        "reference_words": word_count,
+        "character_errors": char_errors,
+        "reference_characters": char_count,
         "cer": char_errors / char_count if char_count else None,
     }
 
@@ -158,6 +204,26 @@ def save_checkpoint(destination, draft, optimizer, scheduler, *, state, metadata
     atomic_write(temporary / "results.json", json.dumps(metadata, indent=2))
     for filename in ("train_command.txt", "speculators.patch"):
         shutil.copy2(destination.parent / filename, temporary / filename)
+    for invocation in sorted(destination.parent.glob("resume-*")):
+        if invocation.is_dir():
+            shutil.copytree(invocation, temporary / "provenance" / invocation.name)
+    for filename in ("run_config.json",):
+        if (destination.parent / filename).exists():
+            shutil.copy2(destination.parent / filename, temporary / filename)
+    # A checksum is part of the complete snapshot, before publication.
+    from speculators.train.whisper_runtime import (  # noqa: PLC0415
+        copy_directory_if_present,
+        hash_file,
+    )
+
+    copy_directory_if_present(
+        destination.parent / "data_provenance", temporary / "data_provenance"
+    )
+
+    atomic_write(
+        temporary / "drafter_checkpoint_sha256.txt",
+        hash_file(temporary / "draft.safetensors") + "\n",
+    )
     if backup.exists():
         shutil.rmtree(backup)
     if destination.exists():
@@ -193,6 +259,22 @@ def acceptance_metrics(results, *, block_size):
         "proposed_by_position": proposed_by_position,
         "accepted_by_position": accepted_by_position,
         "acceptance_by_position": per_position,
+        "conditional_acceptance_by_position": [
+            sum(r.accepted_by_position[i] for r in results) / eligible
+            if (
+                eligible := sum(
+                    r.eligible_by_position[i]
+                    if r.eligible_by_position is not None
+                    else min(
+                        r.proposed_by_position[i],
+                        r.draft_rounds if i == 0 else r.accepted_by_position[i - 1],
+                    )
+                    for r in results
+                )
+            )
+            else None
+            for i in range(block_size - 1)
+        ],
         "definitions": {
             "eal": "1 + accepted draft tokens / draft rounds; includes bonus",
             "mal": "same as EAL; excludes terminal anchor-only rounds",

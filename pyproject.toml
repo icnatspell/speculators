@@ -78,6 +78,11 @@ base = [
 ]
 
 [project.optional-dependencies]
+whisper = [
+    "soundfile>=0.12",
+    "scipy>=1.11",
+    "tensorboard>=2.16",
+]
 mooncake-cuda = [
     "mooncake-transfer-engine>=0.3.12",
 ]

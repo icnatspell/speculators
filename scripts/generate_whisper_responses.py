@@ -1,18 +1,10 @@
-"""Generate pinned, greedy Whisper responses for native prepare-data.
-
-Only token IDs, masks, and references to source audio are written. Whisper
-hidden states remain ephemeral and are recomputed by the trainer as needed.
-"""
+"""Batched, resumable pinned teacher responses; hidden states stay ephemeral."""
 
 import argparse
-import hashlib
-import io
 import json
-import shlex
-import sys
 import time
-from collections import defaultdict
-from datetime import UTC, datetime
+from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
@@ -22,107 +14,90 @@ from train_whisper_dflash import (
     load_teacher_and_rows,
 )
 
-from speculators.provenance import find_repo_root, git_diff, git_sha, package_versions
+from speculators.provenance import atomic_write
 from speculators.train.whisper import generate_whisper_tokens
+from speculators.train.whisper_eval import audio_duration, load_rows
+from speculators.train.whisper_runtime import (
+    hash_file,
+    repair_jsonl_tail,
+    write_provenance,
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--teacher", default="openai/whisper-tiny.en")
-    parser.add_argument(
-        "--teacher-revision", default="87c7102498dcde7456f24cfd30239ca606ed9063"
-    )
+    parser.add_argument("--teacher-revision", default="main")
     parser.add_argument("--dataset", default="openslr/librispeech_asr")
     parser.add_argument("--dataset-config", default="all")
     parser.add_argument(
         "--dataset-revision", default="71cacbfb7e2354c4226d01e70d77d5fca3d04ba1"
     )
-    parser.add_argument(
-        "--split",
-        nargs="+",
-        default=["train.clean.100"],
-        help=(
-            "One or more source splits, e.g. train.clean.100 train.clean.360 "
-            "train.other.500."
-        ),
-    )
-    parser.add_argument(
-        "--max-samples",
-        type=int,
-        help=(
-            "Optional maximum generated rows per split (omit to generate the "
-            "full split)."
-        ),
-    )
+    parser.add_argument("--split", nargs="+", default=["train.clean.100"])
+    parser.add_argument("--max-samples", type=int, help="Maximum output rows per split")
     parser.add_argument("--max-new-tokens", type=int, default=192)
     parser.add_argument("--shuffle-buffer", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--precision",
+        choices=["auto", "float32", "bfloat16", "float16"],
+        default="float32",
+    )
+    parser.add_argument(
+        "--teacher-attention", choices=["eager", "sdpa"], default="sdpa"
+    )
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--audio-workers", type=int, default=1)
     parser.add_argument("--output-file", type=Path, required=True)
     parser.add_argument("--audio-dir", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     if (
-        (args.max_samples is not None and args.max_samples < 1)
-        or min(args.max_new_tokens, args.shuffle_buffer) < 1
-        or len(args.split) != len(set(args.split))
+        min(
+            args.max_new_tokens,
+            args.shuffle_buffer,
+            args.batch_size,
+            args.audio_workers,
+        )
+        < 1
     ):
-        parser.error("Invalid sample limit, duplicate split, or generation setting")
+        parser.error("Counts must be positive")
+    if args.max_samples is not None and args.max_samples < 1:
+        parser.error("max-samples must be positive")
+    if len(args.split) != len(set(args.split)):
+        parser.error("Duplicate splits")
     return args
 
 
-def _load_seen(path: Path) -> dict[str, str | None]:
-    seen = {}
-    if path.exists():
-        with path.open(encoding="utf-8") as source:
-            for line in source:
-                try:
-                    row = json.loads(line)
-                    seen[str(row["id"])] = row.get("source_split")
-                except (json.JSONDecodeError, KeyError):
-                    continue
-    return seen
+def _load_seen(path):
+    if not Path(path).exists():
+        return {}
+    with Path(path).open() as source:
+        return {
+            str(row["id"]): row.get("source_split")
+            for line in source
+            if (row := json.loads(line))
+        }
 
 
-def _write_audio(row: dict, audio_dir: Path) -> str:
+def _write_audio(row, audio_dir):
     audio = row["audio"]
-    audio_bytes = audio.get("bytes")
-    if not isinstance(audio_bytes, bytes):
-        path = Path(audio["path"])
-        if not path.is_absolute() or not path.is_file():
-            raise ValueError(f"No reusable audio bytes or absolute audio file: {path}")
-        return path.resolve().as_uri()
-
+    if not isinstance(audio.get("bytes"), bytes):
+        path = Path(audio["path"]).resolve()
+        if not path.is_file():
+            raise ValueError(f"No reusable audio file: {path}")
+        # Copy into the relocatable corpus root instead of referring elsewhere.
+        data = path.read_bytes()
+    else:
+        data = audio["bytes"]
     audio_dir.mkdir(parents=True, exist_ok=True)
-    row_id = str(row["id"]).replace("/", "_")
-    audio_path = audio_dir / f"{row_id}.flac"
-    if not audio_path.exists():
-        audio_path.write_bytes(audio_bytes)
-    return audio_path.resolve().as_uri()
-
-
-def _rows_for_split(args, split, dataset_sha):
-    from datasets import Audio, load_dataset  # noqa: PLC0415
-    from pyarrow.dataset import ParquetFragmentScanOptions  # noqa: PLC0415
-
-    dataset = load_dataset(
-        args.dataset,
-        args.dataset_config,
-        split=split,
-        revision=dataset_sha,
-        streaming=True,
-        batch_size=1,
-        fragment_scan_options=ParquetFragmentScanOptions(pre_buffer=False),
-    ).cast_column("audio", Audio(decode=False))
-    return iter(dataset.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer))
-
-
-def _duration_seconds(row):
-    import soundfile as sf  # noqa: PLC0415
-
-    audio = row["audio"]
-    source = io.BytesIO(audio["bytes"]) if audio.get("bytes") else audio["path"]
-    return float(sf.info(source).duration)
+    path = audio_dir / (str(row["id"]).replace("/", "_") + ".flac")
+    if not path.exists():
+        temporary = path.with_suffix(".pending")
+        temporary.write_bytes(data)
+        temporary.replace(path)
+    return path.resolve().as_uri()
 
 
 def _summary(values):
@@ -132,176 +107,226 @@ def _summary(values):
         return {"count": 0, "mean": None, "p50": None, "p90": None, "max": None}
     ordered = sorted(values)
     return {
-        "count": len(ordered),
-        "mean": statistics.fmean(ordered),
-        "p50": ordered[int(0.50 * (len(ordered) - 1))],
-        "p90": ordered[int(0.90 * (len(ordered) - 1))],
+        "count": len(values),
+        "mean": statistics.fmean(values),
+        "p50": ordered[int(0.5 * (len(values) - 1))],
+        "p90": ordered[int(0.9 * (len(values) - 1))],
         "max": ordered[-1],
     }
 
 
+def read_audio(row, processor):
+    try:
+        duration = audio_duration(row)
+        return row, audio_features(row, processor, "cpu"), duration
+    except UnsupportedAudioError:
+        return row, None, None
+
+
+@torch.no_grad()
 def main():  # noqa: C901
     args = parse_args()
     args.synthetic = False
-    torch.manual_seed(args.seed)
+    args.skip_source_rows = True
     args.output_file.parent.mkdir(parents=True, exist_ok=True)
     args.audio_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = args.output_file.with_suffix(
+        args.output_file.suffix + ".manifest.json"
+    )
     if args.output_file.exists() and not args.resume:
-        raise FileExistsError("Use a new output file or pass --resume")
-
-    args.splits = list(args.split)
+        raise FileExistsError("Use a new response file or --resume")
+    if args.resume and args.output_file.exists() and not manifest_path.exists():
+        raise ValueError("Cannot resume responses without an initial identity manifest")
+    if args.resume:
+        repair_jsonl_tail(args.output_file)
+    splits = list(args.split)
+    args.split = splits[0]
     metadata = {
         key: str(value) if isinstance(value, Path) else value
         for key, value in vars(args).items()
     }
-    args.split = args.splits[0]
-    teacher, processor, rows = load_teacher_and_rows(args, metadata)
+    teacher, processor, _ = load_teacher_and_rows(args, metadata)
     teacher.eval().requires_grad_(False)
-    manifest = args.output_file.with_suffix(args.output_file.suffix + ".manifest.json")
-    previous_manifest = None
-    if args.resume and manifest.exists():
-        previous_manifest = json.loads(manifest.read_text(encoding="utf-8"))
-        for key in (
-            "teacher_sha",
-            "dataset_sha",
-            "splits",
-            "max_new_tokens",
-            "seed",
-            "shuffle_buffer",
-        ):
-            if previous_manifest.get(key) != metadata.get(key):
-                raise ValueError(f"Resume generation configuration changed: {key}")
     prompt_ids = list(processor.tokenizer.prefix_tokens)
-    prompt = torch.tensor([prompt_ids], device=teacher.device)
-    seen = _load_seen(args.output_file) if args.resume else {}
-    rows_by_split = {}
-    for seen_split in seen.values():
-        if seen_split is not None:
-            rows_by_split[seen_split] = rows_by_split.get(seen_split, 0) + 1
-    written = 0
-    skipped = previous_manifest.get("skipped_rows", 0) if previous_manifest else 0
-    truncated = (
-        previous_manifest.get("truncated_responses", 0) if previous_manifest else 0
+    if len(prompt_ids) + args.max_new_tokens > teacher.config.max_target_positions:
+        raise ValueError("Generation budget exceeds the teacher decoder position limit")
+    identity = {
+        "teacher_sha": metadata["teacher_sha"],
+        "dataset_sha": metadata["dataset_sha"],
+        "splits": splits,
+        "max_new_tokens": args.max_new_tokens,
+        "seed": args.seed,
+        "shuffle_buffer": args.shuffle_buffer,
+        "source_order": "buffer-shuffle-v1",
+        "prompt_token_ids": prompt_ids,
+        "precision": args.precision,
+        "teacher_attention": args.teacher_attention,
+        "batch_size": args.batch_size,
+    }
+    previous = (
+        json.loads(manifest_path.read_text())
+        if args.resume and manifest_path.exists()
+        else {}
     )
-    generated_by_split = {}
-    durations_by_split = defaultdict(list)
-    token_counts_by_split = defaultdict(list)
+    if previous and any(previous.get(key) != value for key, value in identity.items()):
+        raise ValueError("Resume generation identity changed")
+    if (
+        previous.get("status") == "complete"
+        and previous.get("max_samples") == args.max_samples
+    ):
+        if hash_file(args.output_file) != previous["output_sha256"]:
+            raise ValueError("Completed response file content changed")
+        print(
+            "Response generation already complete; preserving its manifest", flush=True
+        )
+        return
+    seen = _load_seen(args.output_file) if args.resume else {}
+    counts = Counter(split for split in seen.values() if split is not None)
+    skipped = previous.get("skipped_rows", 0)
+    stats = defaultdict(list)
+    durations = defaultdict(list)
+    speakers = defaultdict(set)
+    truncated = 0
     if args.resume and args.output_file.exists():
-        with args.output_file.open(encoding="utf-8") as previous_output:
-            for line in previous_output:
-                try:
-                    prior = json.loads(line)
-                    prior_split = prior["source_split"]
-                    durations_by_split[prior_split].append(
-                        float(prior["audio_duration_seconds"])
-                    )
-                    token_counts_by_split[prior_split].append(sum(prior["loss_mask"]))
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                    continue
-    started = time.monotonic()
-
-    with args.output_file.open("a", encoding="utf-8") as output:
-        for split_index, split in enumerate(args.splits):
-            split_rows = (
-                rows
-                if split_index == 0
-                else _rows_for_split(args, split, metadata["dataset_sha"])
-            )
-            split_written = rows_by_split.get(split, 0)
-            if args.max_samples is not None and split_written >= args.max_samples:
-                generated_by_split[split] = split_written
-                continue
-            for row in split_rows:
-                row_id = str(row["id"])
-                if row_id in seen:
-                    continue
-                try:
-                    duration = _duration_seconds(row)
-                    audio = audio_features(row, processor, teacher.device)
-                    audio_url = _write_audio(row, args.audio_dir)
-                    tokens = generate_whisper_tokens(
-                        teacher, audio, prompt, max_new_tokens=args.max_new_tokens
-                    )
-                except UnsupportedAudioError:
-                    skipped += 1
-                    continue
-
-                ids = tokens[0].tolist()
-                generated = ids[len(prompt_ids) :]
-                if not generated:
-                    skipped += 1
-                    continue
-                is_truncated = (
-                    len(generated) == args.max_new_tokens
-                    and generated[-1] != teacher.config.eos_token_id
-                )
-                truncated += is_truncated
-                durations_by_split[split].append(duration)
-                token_counts_by_split[split].append(len(generated))
-                record = {
-                    "id": row_id,
-                    "input_ids": ids,
-                    "loss_mask": [0] * len(prompt_ids) + [1] * len(generated),
-                    "audio_url": audio_url,
-                    "whisper_begin_index": len(prompt_ids),
-                    "source_split": split,
-                    "reference_text": row.get("text", ""),
-                    "speaker_id": row.get("speaker_id"),
-                    "chapter_id": row.get("chapter_id"),
-                    "audio_duration_seconds": duration,
-                }
-                output.write(json.dumps(record, ensure_ascii=False) + "\n")
-                output.flush()
-                seen[row_id] = split
-                written += 1
-                split_written += 1
-                if written % 25 == 0:
-                    print(
-                        f"generated={written} skipped={skipped} truncated={truncated}",
-                        flush=True,
-                    )
-                if args.max_samples is not None and split_written >= args.max_samples:
-                    break
-            generated_by_split[split] = split_written
-
+        with args.output_file.open() as handle:
+            for line in handle:
+                row = json.loads(line)
+                stats[row["source_split"]].append(sum(row["loss_mask"]))
+                durations[row["source_split"]].append(row["audio_duration_seconds"])
+                speakers[row["source_split"]].add(row.get("speaker_id"))
+                truncated += row["input_ids"][-1] != teacher.config.eos_token_id
+    provenance_dir = (
+        args.output_file.parent / f"resume-{time.time_ns()}"
+        if previous
+        else args.output_file.parent
+    )
+    write_provenance(provenance_dir, "generation_command.txt")
     metadata.update(
+        identity,
+        status="running",
         training_policy="fresh_greedy_teacher_responses",
-        splits=args.splits,
-        split_rows=generated_by_split,
-        audio_duration_seconds={
-            split: _summary(values) for split, values in durations_by_split.items()
-        },
-        generated_token_count={
-            split: _summary(values) for split, values in token_counts_by_split.items()
-        },
-        prompt_token_ids=prompt_ids,
-        generated_rows=sum(generated_by_split.values()),
+        output_file=str(args.output_file.resolve()),
+        audio_dir=str(args.audio_dir.resolve()),
+    )
+    # Publish immutable identity before any response row, including the first run.
+    atomic_write(manifest_path, json.dumps(metadata, indent=2))
+    started = time.monotonic()
+    written = 0
+    with (
+        ThreadPoolExecutor(max_workers=args.audio_workers) as pool,
+        args.output_file.open("a") as output,
+    ):
+        for split in splits:
+            pending = []
+
+            def flush(pending=pending, split=split):
+                nonlocal written, truncated, skipped
+                if not pending:
+                    return
+                audio = torch.cat([item[1] for item in pending]).to(
+                    teacher.device, dtype=teacher.dtype
+                )
+                prompt = torch.tensor([prompt_ids], device=teacher.device).expand(
+                    len(pending), -1
+                )
+                lengths = torch.tensor(
+                    [item[2] for item in pending], device=audio.device
+                ) * (
+                    processor.feature_extractor.sampling_rate
+                    / processor.feature_extractor.hop_length
+                )
+                attention_mask = (
+                    torch.arange(audio.shape[-1], device=audio.device)[None]
+                    < lengths.ceil()[:, None]
+                ).long()
+                sequences = generate_whisper_tokens(
+                    teacher,
+                    audio,
+                    prompt,
+                    max_new_tokens=args.max_new_tokens,
+                    attention_mask=attention_mask,
+                ).cpu()
+                for (row, _audio, duration), sequence in zip(
+                    pending, sequences, strict=True
+                ):
+                    ids = sequence.tolist()
+                    tail = ids[len(prompt_ids) :]
+                    if teacher.config.eos_token_id in tail:
+                        ids = ids[
+                            : len(prompt_ids)
+                            + tail.index(teacher.config.eos_token_id)
+                            + 1
+                        ]
+                    uri = _write_audio(row, args.audio_dir)
+                    count = len(ids) - len(prompt_ids)
+                    record = {
+                        "id": row["id"],
+                        "input_ids": ids,
+                        "loss_mask": [0] * len(prompt_ids) + [1] * count,
+                        "audio_url": uri,
+                        "audio_relative_path": Path(uri).name,
+                        "whisper_begin_index": len(prompt_ids),
+                        "source_split": split,
+                        "reference_text": row.get("text", ""),
+                        "speaker_id": row.get("speaker_id"),
+                        "chapter_id": row.get("chapter_id"),
+                        "audio_duration_seconds": duration,
+                    }
+                    output.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    seen[str(row["id"])] = split
+                    counts[split] += 1
+                    written += 1
+                    truncated += ids[-1] != teacher.config.eos_token_id
+                    stats[split].append(count)
+                    durations[split].append(duration)
+                    speakers[split].add(row.get("speaker_id"))
+                output.flush()
+                pending.clear()
+                metadata.update(
+                    generated_rows=sum(counts.values()),
+                    split_rows=dict(counts),
+                    skipped_rows=skipped,  # noqa: B023 -- synchronous flush reads live counter
+                )
+                atomic_write(manifest_path, json.dumps(metadata, indent=2))
+                print(f"generated={written} skipped={skipped}", flush=True)  # noqa: B023 -- synchronous flush
+
+            source = (
+                row
+                for row in load_rows(args, split, metadata["dataset_sha"], shuffle=True)
+                if str(row["id"]) not in seen
+            )
+            # executor.map without a buffersize eagerly submits an entire stream;
+            # submit bounded windows explicitly to keep corpus memory bounded.
+            from itertools import islice  # noqa: PLC0415
+
+            while window := list(islice(source, args.batch_size)):
+                if args.max_samples is not None and counts[split] >= args.max_samples:
+                    break
+                for item in pool.map(lambda row: read_audio(row, processor), window):
+                    if item[1] is None:
+                        skipped += 1
+                        continue
+                    if (
+                        args.max_samples is None
+                        or counts[split] + len(pending) < args.max_samples
+                    ):
+                        pending.append(item)
+                flush()
+            flush()
+    metadata.update(
+        status="complete",
+        split_rows=dict(counts),
+        generated_rows=sum(counts.values()),
         generated_this_invocation=written,
         skipped_rows=skipped,
         truncated_responses=truncated,
         elapsed_seconds=time.monotonic() - started,
-        output_file=str(args.output_file.resolve()),
-        audio_dir=str(args.audio_dir.resolve()),
-        output_sha256=hashlib.sha256(args.output_file.read_bytes()).hexdigest(),
+        output_sha256=hash_file(args.output_file),
+        audio_duration_seconds={s: _summary(v) for s, v in durations.items()},
+        generated_token_count={s: _summary(v) for s, v in stats.items()},
+        speakers_by_split={s: len(v) for s, v in speakers.items()},
     )
-    repo_root = find_repo_root(Path(__file__))
-    metadata["git_sha"] = git_sha(repo_root)
-    metadata["package_versions"] = package_versions()
-    manifest.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-    command = [
-        f"# timestamp_utc: {datetime.now(UTC).isoformat()}",
-        f"# git_sha: {metadata['git_sha']}",
-        *metadata["package_versions"],
-        f"# argv: {shlex.join(sys.argv)}",
-    ]
-    (args.output_file.parent / "generation_command.txt").write_text(
-        "\n".join(command) + "\n", encoding="utf-8"
-    )
-    if repo_root is not None:
-        (args.output_file.parent / "speculators.patch").write_text(
-            f"# repo: {repo_root} ({metadata['git_sha']})\n{git_diff(repo_root)}\n",
-            encoding="utf-8",
-        )
+    atomic_write(manifest_path, json.dumps(metadata, indent=2))
     print(json.dumps(metadata, indent=2), flush=True)
 
 

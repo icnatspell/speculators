@@ -2,6 +2,77 @@
 
 Branch: `whisper-dflash-online`.
 
+## Current recommended workflow
+
+Install the supported dependencies with `uv sync --extra whisper` (or
+`pip install -e '.[whisper]'`). Use the custom PyTorch online trainer; Hugging
+Face supplies the teacher, tokenizer, processor, and datasets, rather than
+`Trainer`. The sections below this workflow also preserve earlier experiments.
+
+Run `examples/train/dflash_whisper_large_v2_librispeech.sh` on the training
+machine. The stages are offline batched teacher response generation, native
+`prepare-data`, batched online teacher feature extraction and drafter training,
+then standalone held-out evaluation. Teacher revision is resolved once and
+pinned across stages. Responses and compressed audio are relocatable; hidden
+states are never persisted. English/transcribe/no-timestamps is explicit.
+Audio is resampled only when necessary to 16 kHz, and clips over 30 seconds
+are excluded with coverage counts. The corpus uses all three training splits;
+validation uses dev-clean/dev-other; test-clean/test-other remain untouched.
+
+The full recipe defaults to automatic BF16/FP16 selection, FP32 master draft
+weights, SDPA attention, fused KL, batch size four, accumulation two, bounded
+length bucketing, and CPU audio workers. On two GPUs the teacher and drafter
+use different devices with a bounded feature queue. Evaluation/checkpointing
+quiesce the producer. On one GPU they run sequentially. Set batch sizes to fit
+VRAM; effective utterances/update are `BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS`.
+The teacher microbatch is independently configurable. `COMPILE=1` is optional;
+benchmark it on the target machine because variable sequence shapes can recompile.
+
+The objective includes EOS and partial terminal blocks, prevents attention
+between packed utterances, balances anchor budgets per utterance, and aligns
+teacher/draft logits with suppression policy. Optional `--response-ce-weight`,
+`--position-weight dpace`, and `--raw-targets` support controlled ablations.
+Default feature layers span decoder depth instead of selecting only early layers.
+
+Training reports loss, EAL proxy, throughput, audio hours and data exposure.
+Fixed speaker/duration-balanced dev samples report token-weighted validation
+loss every 1,000 updates and decoded MAL/acceptance by position every 5,000.
+TensorBoard is enabled in the recipe. The best checkpoint maximizes pooled dev
+MAL at the configured block size. WER uses Whisper English normalization and
+measures transcript quality; exact speculative token agreement means its WER
+must equal the teacher's; reduced-precision drift is reported explicitly. MAL, unlike training EAL, measures actual decoding.
+
+Checkpoints save optimizer, scheduler, scaler, RNG, data position, pending
+metrics, identities, and provenance. Resume replays deterministic batches;
+derived Hugging Face shuffle caches do not alter the prepared corpus identity.
+Use `RESUME=1` to continue. Keep generation/preparation/training provenance
+alongside the artifacts when moving or publishing a run.
+
+Standalone benchmark:
+
+```bash
+PYTHONPATH=src:hs_connectors/src:scripts .venv/bin/python scripts/evaluate_whisper_dflash.py \
+  --checkpoint runs/whisper_dflash_large_v2_librispeech/training/best \
+  --split test.clean test.other --device cuda --repetitions 5 \
+  --output-dir runs/whisper_dflash_large_v2_librispeech/test-benchmark
+```
+
+Omit `--samples` for full eligible test coverage; specify it for a balanced pilot.
+Both methods use the same teacher precision/backend, warmed caches and encoder
+outputs. The full recipe defaults to FP32 for the strict reference benchmark;
+set `BENCHMARK_PRECISION` to measure the intended deployment precision. Timing starts after the first token and ends at the final token;
+loading, audio preparation, encoder work and TTFT are excluded. Order alternates
+and repeated per-clip medians are pooled. Reports include paired bootstrap speedup
+intervals, MAL, conditional acceptance, WER, per-split/length/duration results,
+device metadata and checkpoint provenance. `--profile` runs separate stage
+measurements outside benchmark timings. Co-locate drafter and teacher for the
+primary benchmark; a separate drafter GPU is explicitly labelled.
+
+Validation so far: supported PyTorch 2.9 CPU checks, exact accumulated-training
+resume equivalence, CUDA fused/eager loss and gradient equivalence, and a short
+real tiny.en run. This establishes pipeline correctness, not useful acceptance;
+use a moderate learning pilot before committing substantial compute.
+
 ## Scope
 
 Single GPU, English transcription without timestamps, streamed LibriSpeech
@@ -228,8 +299,9 @@ The reproducible full-data path is now in
 Whisper Large-v2 targets for `train.clean.100`, `train.clean.360`, and
 `train.other.500`, passes the resulting JSONL through the native
 `speculators prepare-data` path, and trains the drafter while recomputing only
-the current sample's Whisper features. It defaults to 200,000 updates and one
-deterministically shuffled epoch; set `STEPS` or `EPOCHS` to change that run.
+the current batch's Whisper features. It defaults to three globally shuffled
+epochs, batch size four, and two gradient accumulation steps. The update budget
+is derived from prepared dataset size; set `STEPS` or `EPOCHS` to change it.
 Evaluation samples are taken from both `validation.clean` and
 `validation.other` at each evaluation checkpoint. The recipe is provided for a
 larger training machine and has not been launched from this workspace.
@@ -251,7 +323,7 @@ for a smoke run.
 
 Teacher feature extraction can run in a bounded producer thread while the
 drafter trains on the next sample. The full-data recipe selects the first two
-visible GPUs and enables a two-sample prefetch queue when at least two CUDA
+visible GPUs and enables a two-microbatch prefetch queue when at least two CUDA
 devices are available; otherwise it uses one GPU with prefetch disabled. Set
 `TEACHER_DEVICE` and `DRAFT_DEVICE` to override device selection. The queue
 holds only a small number of detached feature batches in memory; queued work is
@@ -434,3 +506,40 @@ The attempted native vLLM path was abandoned because Whisper's encoder-decoder
 serving and speculative interfaces required broader changes than this training
 experiment can justify. The staged response/preparation workflow retains the
 useful Speculators data-generation practices without a live vLLM dependency.
+
+### Reduced-precision correctness
+
+FP32 remains the strict reference benchmark in the full recipe. BF16 block
+verification can change an argmax relative to single-token decoding because
+matrix shapes change floating-point rounding, even with causal attention.
+Reduced-precision dev evaluation records token-match rates and both WERs;
+FP32 dev evaluation requires exact agreement. Standalone evaluation requires
+exact agreement unless `--allow-token-mismatch` is explicitly set. To measure
+the intended reduced-precision deployment, use `BENCHMARK_PRECISION=auto
+ALLOW_TOKEN_MISMATCH=1` and inspect mismatch rate and WER along with speed.
+Do not compare FP32 timings with a reduced-precision baseline. Drafter autocast
+is scoped to the drafter so it never changes teacher precision implicitly.
+
+A two-update tiny.en smoke consumed four training clips across two passes,
+with two fixed balanced dev-clean samples. Dev MAL was about 1.04. An FP32
+two-clip test-clean check gave MAL 1.087 and 0.538x generation speed, with exact
+tokens and identical WER (6.67%). These are pipeline checks, not learning or
+performance claims. The first streaming benchmark wrote results but hit a
+local native-library shutdown failure; the reusable `--sample-cache` supports
+repeating inference separately from the streaming scan.
+
+A bounded full-workflow pilot can use:
+
+```bash
+TEACHER=openai/whisper-tiny.en TRAIN_SPLITS=train.clean.100 \
+GENERATION_MAX_SAMPLES=64 SHUFFLE_BUFFER=128 MAX_NEW_TOKENS=192 \
+EPOCHS=3 EVAL_SAMPLES=8 EVAL_EVERY=10 DECODE_EVERY=10 LOG_EVERY=1 \
+RUN_BENCHMARK=0 OUTPUT_DIR=runs/whisper-pipeline-pilot \
+  examples/train/dflash_whisper_large_v2_librispeech.sh
+```
+
+For a learning pilot, increase response coverage and data passes deliberately;
+measure held-out MAL rather than extrapolating from these tiny smoke results.
+The GPU fused-loss/SDPA gradient regression and drafter-only autocast regression
+pass locally. Only one CUDA GPU is available, so the two-GPU integration gate
+remains a check for the larger machine.

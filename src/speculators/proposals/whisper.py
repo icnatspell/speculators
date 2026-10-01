@@ -5,6 +5,7 @@ are removed from the self-attention cache and auxiliary-feature history.
 """
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -33,6 +34,7 @@ class WhisperDecodeResult:
     draft_rounds: int = 0
     proposed_by_position: list[int] | None = None
     accepted_by_position: list[int] | None = None
+    eligible_by_position: list[int] | None = None
 
 
 class DFlashWhisperContextCache:
@@ -308,6 +310,7 @@ def speculative_whisper_decode(  # noqa: C901
     encoder_outputs=None,
     measure_generation: bool = False,
     optimize_decode: bool = True,
+    draft_dtype: torch.dtype | None = None,
 ) -> WhisperDecodeResult:
     """Verify parallel proposals against causal Whisper greedy predictions.
 
@@ -318,11 +321,21 @@ def speculative_whisper_decode(  # noqa: C901
     _validate_inputs(teacher, prompt, max_new_tokens)
     teacher.eval()
     draft.eval()
+
+    def draft_autocast():
+        if draft_dtype is None or draft_dtype == torch.float32:
+            return nullcontext()
+        return torch.autocast(draft.embed_tokens.weight.device.type, dtype=draft_dtype)
+
     if processors is None:
         processors = whisper_processors(teacher, prompt.shape[1])
     selector = WhisperTokenSelector(processors, teacher.device, optimize_decode)
     timer = WhisperStageTimer(teacher.device, profile)
-    generation_timer = WhisperGenerationTimer(teacher.device, measure_generation)
+    generation_timer = WhisperGenerationTimer(
+        teacher.device,
+        measure_generation,
+        extra_devices=[draft.embed_tokens.weight.device],
+    )
     with timer.measure("encoder"):
         encoder = encoder_outputs
         if encoder is None:
@@ -343,11 +356,12 @@ def speculative_whisper_decode(  # noqa: C901
         1,
         proposed_by_position=[0] * (draft.block_size - 1),
         accepted_by_position=[0] * (draft.block_size - 1),
+        eligible_by_position=[0] * (draft.block_size - 1),
     )
     limit = prompt.shape[1] + max_new_tokens
     draft_cache = DFlashWhisperContextCache() if cache_draft_context else None
     if draft_cache is not None and proposal_fn is dflash_whisper_proposal:
-        with timer.measure("draft_prefill"):
+        with timer.measure("draft_prefill"), draft_autocast():
             draft_cache.update(draft, context.to(draft.embed_tokens.weight.device))
     while prefix.shape[1] < limit:
         with timer.measure("selection"):
@@ -359,7 +373,7 @@ def speculative_whisper_decode(  # noqa: C901
             prefix = torch.cat([prefix, anchor], dim=1)
             break
         generation_timer.begin()
-        with timer.measure("draft"):
+        with timer.measure("draft"), draft_autocast():
             if proposal_fn is dflash_whisper_proposal:
                 proposal_logits = proposal_fn(
                     draft,
@@ -401,6 +415,9 @@ def speculative_whisper_decode(  # noqa: C901
                 teacher.config.eos_token_id,
             )
         result.accepted_tokens += accepted - 1
+        for position in range(candidates.shape[1] - 1):
+            if position == 0 or accepted - 1 >= position:
+                result.eligible_by_position[position] += 1
         for position in range(accepted - 1):
             result.accepted_by_position[position] += 1
         rejected = candidates.shape[1] - accepted

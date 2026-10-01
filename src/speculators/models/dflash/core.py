@@ -344,11 +344,25 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )
 
     @torch.compiler.disable
-    def _build_attention_mask(self, loss_mask, max_anchors, document_ids, device):
+    def _build_attention_mask(
+        self,
+        loss_mask,
+        max_anchors,
+        document_ids,
+        device,
+        *,
+        allow_partial_blocks=False,
+        anchors_per_document=False,
+    ):
         total_seq_len = loss_mask.shape[1]
 
         anchor_positions, anchor_valid = select_anchors(
-            loss_mask, max_anchors, self.block_size
+            loss_mask,
+            max_anchors,
+            self.block_size,
+            document_ids=document_ids,
+            allow_partial_blocks=allow_partial_blocks,
+            anchors_per_document=anchors_per_document,
         )
 
         full_attn_mask = None
@@ -393,6 +407,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         device = hidden_states.device
         total_seq_len = hidden_states.shape[1]
         num_anchors = kwargs.pop("max_anchors", 512)
+        allow_partial_blocks = kwargs.pop("allow_partial_blocks", False)
+        anchors_per_document = kwargs.pop("anchors_per_document", False)
 
         if position_ids is None:
             position_ids = torch.arange(
@@ -400,7 +416,14 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             ).unsqueeze(0)
 
         full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid = (
-            self._build_attention_mask(loss_mask, num_anchors, document_ids, device)
+            self._build_attention_mask(
+                loss_mask,
+                num_anchors,
+                document_ids,
+                device,
+                allow_partial_blocks=allow_partial_blocks,
+                anchors_per_document=anchors_per_document,
+            )
         )
 
         mask_tokens_size = num_anchors * self.block_size
@@ -432,6 +455,16 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         anchored_block_indices = get_base_indices_for_anchored_blocks(
             anchor_positions, self.block_size
         )  # shape: [num_anchors*block_size]
+
+        if allow_partial_blocks:
+            raw_indices = anchored_block_indices
+            anchored_block_indices = raw_indices.clamp(max=total_seq_len - 1)
+            anchor_docs = document_ids[:, anchor_positions].repeat_interleave(
+                self.block_size, dim=1
+            )
+            valid_slots = (raw_indices < total_seq_len)[None] & (
+                document_ids[:, anchored_block_indices] == anchor_docs
+            )
 
         with torch.no_grad():
             if anchored_block_indices.numel() < total_seq_len:
@@ -470,6 +503,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         # shape: [1, num_anchors*block_size, vocab_size]
 
         aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]
+        if allow_partial_blocks:
+            aligned_loss_mask = aligned_loss_mask * valid_slots
         # shape: [1, num_anchors*block_size]
 
         # zero out any padded anchor blocks

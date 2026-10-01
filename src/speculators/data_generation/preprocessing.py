@@ -471,6 +471,7 @@ def _passthrough_pretokenized(
         for field in (
             "audio_url",
             "whisper_begin_index",
+            "audio_relative_path",
             "id",
             "speaker_id",
             "chapter_id",
@@ -831,10 +832,13 @@ def _resolve_pad_token(processor: ProcessorLike):
         tokenizer.pad_token = tokenizer.eos_token
 
 
-def load_processor(target_model_path: str, *, trust_remote_code: bool = False):
+def load_processor(
+    target_model_path: str, *, trust_remote_code: bool = False, revision=None
+):
     processor = AutoProcessor.from_pretrained(
         target_model_path,
         trust_remote_code=trust_remote_code,
+        **({"revision": revision} if revision else {}),
     )
     _resolve_pad_token(processor)
 
@@ -855,6 +859,7 @@ def load_and_preprocess_dataset(
     allow_empty_output: bool = False,
     trust_remote_code: bool = False,
     skip_token_freq: bool = True,
+    processor_revision: str | None = None,
 ) -> tuple[HFDataset, ProcessorLike]:
     """Load, tokenize, and preprocess a dataset for speculator training.
 
@@ -893,7 +898,11 @@ def load_and_preprocess_dataset(
         )
 
     log.subsection("Loading processor")
-    processor = load_processor(target_model_path, trust_remote_code=trust_remote_code)
+    processor = load_processor(
+        target_model_path,
+        trust_remote_code=trust_remote_code,
+        **({"revision": processor_revision} if processor_revision else {}),
+    )
 
     processor_has_chat_template = (
         hasattr(processor, "apply_chat_template")

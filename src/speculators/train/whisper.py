@@ -6,6 +6,9 @@ All frozen teacher-owned draft tensors are saved for independent reloading.
 
 import copy
 import json
+from contextlib import nullcontext
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -16,14 +19,23 @@ from speculators.config import SpeculatorsConfig, VerifierConfig
 from speculators.losses import resolve_loss_config
 from speculators.models.dflash import DFlashSpeculatorConfig
 from speculators.models.dflash.core import DFlashDraftModel
+from speculators.models.dflash.metrics import compute_metrics
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 
 
 @torch.no_grad()
-def generate_whisper_tokens(teacher, audio, prompt, *, max_new_tokens):
+def generate_whisper_tokens(
+    teacher, audio, prompt, *, max_new_tokens, attention_mask=None
+):
     """Keep the decoder prompt and EOS which Whisper strips from plain output."""
+    if attention_mask is None:
+        # Short-form features are fixed-length encoder inputs with no decoder padding.
+        attention_mask = torch.ones(
+            audio.shape[0], audio.shape[-1], device=audio.device, dtype=torch.long
+        )
     tokens = teacher.generate(
         input_features=audio,
+        attention_mask=attention_mask,
         decoder_input_ids=prompt,
         do_sample=False,
         num_beams=1,
@@ -42,6 +54,7 @@ def build_whisper_draft(
     *,
     block_size: int = 4,
     num_layers: int = 1,
+    attention_implementation: str = "eager",
 ) -> DFlashDraftModel:
     """Build a Qwen3 draft with Whisper's width/vocabulary and frozen head."""
     if block_size < 2 or num_layers < 1:  # noqa: PLR2004
@@ -59,7 +72,7 @@ def build_whisper_draft(
         head_dim=head_dim,
         vocab_size=cfg.vocab_size,
         max_position_embeddings=cfg.max_target_positions,
-        _attn_implementation="eager",
+        _attn_implementation=attention_implementation,
     )
     draft = DFlashDraftModel(
         DFlashSpeculatorConfig(
@@ -94,28 +107,109 @@ def build_whisper_draft(
     return draft
 
 
-def train_whisper_step(
-    draft: DFlashDraftModel,
-    optimizer: torch.optim.Optimizer,
-    features: dict[str, torch.Tensor],
-    *,
-    max_anchors: int = 4,
-    metrics_sink: dict | None = None,
-) -> float:
-    """One finite-gradient update; caller owns the current feature batch."""
-    valid = features["loss_mask"][0, : -draft.block_size].bool()
-    if not valid.any():
-        raise ValueError("Continuation is too short for an anchored draft block")
+@dataclass(frozen=True)
+class WhisperLossOptions:
+    implementation: str = "eager"
+    policy_targets: bool = True
+    response_ce_weight: float = 0.0
+    position_weight: str = "fixed-exp-decay"
+    gamma: float = 4.0
+    dpace_alpha: float = 0.5
+
+
+def whisper_draft_loss(
+    draft, features, *, max_anchors=32, options=None, suppressed_tokens=()
+):
+    """Policy-aligned distillation with independent partial blocks per utterance."""
+    options = options or WhisperLossOptions()
+    if "document_ids" in features:
+        max_anchors *= torch.unique(features["document_ids"]).numel()
+    _, logits, targets, mask, indices = draft._backbone_forward(  # noqa: SLF001 -- reuse native anchored transformer
+        **features,
+        max_anchors=max_anchors,
+        allow_partial_blocks=True,
+        anchors_per_document=True,
+    )
+    raw_agreement = targets.argmax(-1) == features["input_ids"][:, indices]
+    suppressed_tokens = [
+        token for token in suppressed_tokens if 0 <= token < logits.shape[-1]
+    ]
+    if options.policy_targets and suppressed_tokens:
+        # Finite sentinels avoid 0 * inf NaNs in KL/fused kernels.
+        logits = logits.index_fill(
+            -1,
+            torch.as_tensor(suppressed_tokens, device=logits.device, dtype=torch.long),
+            torch.finfo(logits.dtype).min,
+        )
+        targets = targets.index_fill(
+            -1,
+            torch.as_tensor(suppressed_tokens, device=targets.device, dtype=torch.long),
+            torch.finfo(targets.dtype).min,
+        )
+    losses = resolve_loss_config("kl_div", implementation=options.implementation)
+    if options.response_ce_weight:
+        labels = features["input_ids"][:, indices]
+
+        def response_ce(scores, _targets):
+            return torch.nn.functional.cross_entropy(
+                scores.float().reshape(-1, scores.shape[-1]),
+                labels.reshape(-1),
+                reduction="none",
+            ).reshape_as(labels)
+
+        losses["response_ce"] = (response_ce, options.response_ce_weight)
+    loss, metrics = compute_metrics(
+        logits,
+        targets,
+        mask,
+        draft.block_size,
+        gamma=options.gamma,
+        loss_config=losses,
+        per_position_loss_weight=options.position_weight,
+        dpace_alpha=options.dpace_alpha,
+    )
+    count = mask.sum()
+    metrics["weighted_loss_sum"] = loss.detach() * count
+    metrics["weighted_loss_total"] = count
+    metrics["raw_teacher_agreement_sum"] = (raw_agreement * mask).sum()
+    metrics["raw_teacher_agreement_total"] = count
+    metrics["policy_teacher_agreement_sum"] = (
+        (targets.argmax(-1) == features["input_ids"][:, indices]) * mask
+    ).sum()
+    metrics["policy_teacher_agreement_total"] = count
+    return loss, metrics
+
+
+def make_whisper_loss(
+    draft, *, options, max_anchors, suppressed_tokens=(), compile_model=False
+):
+    function = partial(
+        whisper_draft_loss,
+        draft,
+        options=options,
+        max_anchors=max_anchors,
+        suppressed_tokens=suppressed_tokens,
+    )
+    if compile_model:
+        return torch.compile(function, dynamic=True)
+    return function
+
+
+def metrics_to_cpu(metrics):
+    values = (
+        torch.stack([value.detach().float() for value in metrics.values()])
+        .cpu()
+        .tolist()
+    )
+    return dict(zip(metrics, values, strict=True))
+
+
+def train_whisper_step(draft, optimizer, features, *, max_anchors=4, metrics_sink=None):
+    """Compatibility single-step trainer; production batches use the shared loss."""
     draft.train()
     optimizer.zero_grad(set_to_none=True)
-    # Existing DFlash wrappers compile whenever a GPU is present, even for CPU
-    # tensors. This experimental path deliberately uses eager attention/loss.
     with torch.compiler.set_stance("force_eager"):
-        _, loss, metrics = draft(
-            **features,
-            max_anchors=max_anchors,
-            loss_config=resolve_loss_config("kl_div", implementation="eager"),
-        )
+        loss, metrics = whisper_draft_loss(draft, features, max_anchors=max_anchors)
     if not torch.isfinite(loss):
         raise RuntimeError("Non-finite Whisper draft loss")
     loss.backward()
@@ -126,13 +220,17 @@ def train_whisper_step(
     )
     optimizer.step()
     if metrics_sink is not None:
-        values = (
-            torch.stack([value.detach().float() for value in metrics.values()])
-            .cpu()
-            .tolist()
-        )
-        metrics_sink.update(zip(metrics, values, strict=True))
+        metrics_sink.update(metrics_to_cpu(metrics))
     return float(loss.detach())
+
+
+def whisper_autocast(device, dtype):
+    device = torch.device(device)
+    return (
+        torch.autocast(device.type, dtype=dtype)
+        if device.type in ("cuda", "cpu") and dtype != torch.float32
+        else nullcontext()
+    )
 
 
 def save_whisper_draft(draft: DFlashDraftModel, directory: Path) -> None:
@@ -142,6 +240,7 @@ def save_whisper_draft(draft: DFlashDraftModel, directory: Path) -> None:
         "format": "whisper-dflash-experimental-v1",
         "draft_config": draft.config.to_dict(),
         "verifier_norm_eps": draft.verifier_norm.eps,
+        "attention_implementation": draft._attn_impl,  # noqa: SLF001 -- persisted backend
     }
     (directory / "whisper_draft.json").write_text(json.dumps(metadata, indent=2))
     save_file(
@@ -161,7 +260,9 @@ def load_whisper_draft(directory: Path) -> DFlashDraftModel:
     config = DFlashSpeculatorConfig.model_validate(metadata["draft_config"])
     # HF config serialization omits the private attention setting. This
     # experimental checkpoint format always uses eager attention.
-    config.transformer_layer_config._attn_implementation = "eager"  # noqa: SLF001
+    config.transformer_layer_config._attn_implementation = metadata.get(  # noqa: SLF001
+        "attention_implementation", "eager"
+    )
     draft = DFlashDraftModel(config)
     draft.verifier_norm = torch.nn.LayerNorm(
         draft.hidden_size, eps=metadata["verifier_norm_eps"]
