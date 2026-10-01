@@ -1,4 +1,4 @@
-"""Experimental in-process Whisper/DFlash training building blocks.
+"""Experimental in-process Whisper drafter training building blocks.
 
 Checkpoints use explicit helpers here, not the generic vLLM/HF draft loader.
 All frozen teacher-owned draft tensors are saved for independent reloading.
@@ -20,7 +20,10 @@ from speculators.losses import resolve_loss_config
 from speculators.models.dflash import DFlashSpeculatorConfig
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dflash.metrics import compute_metrics
+from speculators.models.eagle3 import Eagle3SpeculatorConfig
+from speculators.models.eagle3.whisper import WhisperEagle3DraftModel
 from speculators.proposals.greedy import GreedyTokenProposalConfig
+from speculators.train.whisper_eagle3 import eagle3_whisper_loss
 
 
 @torch.no_grad()
@@ -55,8 +58,11 @@ def build_whisper_draft(
     block_size: int = 4,
     num_layers: int = 1,
     attention_implementation: str = "eager",
-) -> DFlashDraftModel:
-    """Build a Qwen3 draft with Whisper's width/vocabulary and frozen head."""
+    algorithm: str = "dflash",
+) -> DFlashDraftModel | WhisperEagle3DraftModel:
+    """Build a native drafter with Whisper's dimensions and verifier weights."""
+    if algorithm not in ("dflash", "eagle3"):
+        raise ValueError(f"Unsupported Whisper drafter: {algorithm}")
     if block_size < 2 or num_layers < 1:  # noqa: PLR2004
         raise ValueError("Need block_size >= 2 and num_layers >= 1")
     cfg = teacher.config
@@ -74,23 +80,43 @@ def build_whisper_draft(
         max_position_embeddings=cfg.max_target_positions,
         _attn_implementation=attention_implementation,
     )
-    draft = DFlashDraftModel(
-        DFlashSpeculatorConfig(
-            transformer_layer_config=transformer,
-            draft_vocab_size=cfg.vocab_size,
-            block_size=block_size,
-            aux_hidden_state_layer_ids=target_layer_ids,
-            mask_token_id=cfg.pad_token_id,
-            speculators_config=SpeculatorsConfig(
-                algorithm="dflash",
-                proposal_methods=[
-                    GreedyTokenProposalConfig(speculative_tokens=block_size - 1)
-                ],
-                default_proposal_method="greedy",
-                verifier=VerifierConfig.from_config(cfg, name_or_path=None),
-            ),
+    if algorithm == "dflash":
+        draft = DFlashDraftModel(
+            DFlashSpeculatorConfig(
+                transformer_layer_config=transformer,
+                draft_vocab_size=cfg.vocab_size,
+                block_size=block_size,
+                aux_hidden_state_layer_ids=target_layer_ids,
+                mask_token_id=cfg.pad_token_id,
+                speculators_config=SpeculatorsConfig(
+                    algorithm="dflash",
+                    proposal_methods=[
+                        GreedyTokenProposalConfig(speculative_tokens=block_size - 1)
+                    ],
+                    default_proposal_method="greedy",
+                    verifier=VerifierConfig.from_config(cfg, name_or_path=None),
+                ),
+            )
         )
-    )
+    else:
+        draft = WhisperEagle3DraftModel(
+            Eagle3SpeculatorConfig(
+                transformer_layer_config=transformer,
+                draft_vocab_size=cfg.vocab_size,
+                eagle_aux_hidden_state_layer_ids=target_layer_ids,
+                norm_before_fc=True,
+                norm_output=True,
+                speculators_config=SpeculatorsConfig(
+                    algorithm="eagle3",
+                    proposal_methods=[
+                        GreedyTokenProposalConfig(speculative_tokens=block_size - 1)
+                    ],
+                    default_proposal_method="greedy",
+                    verifier=VerifierConfig.from_config(cfg, name_or_path=None),
+                ),
+            ),
+            block_size=block_size,
+        )
     draft.to(device=teacher.device, dtype=teacher.dtype)
     draft.verifier_norm = copy.deepcopy(teacher.model.decoder.layer_norm)
     with torch.no_grad():
@@ -99,11 +125,12 @@ def build_whisper_draft(
         draft.verifier_lm_head.weight.copy_(teacher.proj_out.weight)
     for module in (
         draft.embed_tokens,
-        draft.lm_head,
         draft.verifier_lm_head,
         draft.verifier_norm,
     ):
         module.requires_grad_(False)
+    if algorithm == "dflash":
+        draft.lm_head.requires_grad_(False)
     return draft
 
 
@@ -115,6 +142,7 @@ class WhisperLossOptions:
     position_weight: str = "fixed-exp-decay"
     gamma: float = 4.0
     dpace_alpha: float = 0.5
+    rollout_decay: float = 1.0
 
 
 def whisper_draft_loss(
@@ -122,6 +150,10 @@ def whisper_draft_loss(
 ):
     """Policy-aligned distillation with independent partial blocks per utterance."""
     options = options or WhisperLossOptions()
+    if isinstance(draft, WhisperEagle3DraftModel):
+        return eagle3_whisper_loss(
+            draft, features, options=options, suppressed_tokens=suppressed_tokens
+        )
     if "document_ids" in features:
         max_anchors *= torch.unique(features["document_ids"]).numel()
     _, logits, targets, mask, indices = draft._backbone_forward(  # noqa: SLF001 -- reuse native anchored transformer
@@ -233,11 +265,16 @@ def whisper_autocast(device, dtype):
     )
 
 
-def save_whisper_draft(draft: DFlashDraftModel, directory: Path) -> None:
+def save_whisper_draft(
+    draft: DFlashDraftModel | WhisperEagle3DraftModel, directory: Path
+) -> None:
     """Save a self-contained experimental training checkpoint (no features)."""
     directory.mkdir(parents=True, exist_ok=True)
     metadata = {
-        "format": "whisper-dflash-experimental-v1",
+        "format": "whisper-eagle3-experimental-v1"
+        if isinstance(draft, WhisperEagle3DraftModel)
+        else "whisper-dflash-experimental-v1",
+        "block_size": draft.block_size,
         "draft_config": draft.config.to_dict(),
         "verifier_norm_eps": draft.verifier_norm.eps,
         "attention_implementation": draft._attn_impl,  # noqa: SLF001 -- persisted backend
@@ -252,27 +289,36 @@ def save_whisper_draft(draft: DFlashDraftModel, directory: Path) -> None:
     )
 
 
-def load_whisper_draft(directory: Path) -> DFlashDraftModel:
+def load_whisper_draft(directory: Path) -> DFlashDraftModel | WhisperEagle3DraftModel:
     """Reload without downloading or instantiating a Whisper teacher."""
     metadata = json.loads((directory / "whisper_draft.json").read_text())
-    if metadata["format"] != "whisper-dflash-experimental-v1":
+    formats = {
+        "whisper-dflash-experimental-v1": DFlashSpeculatorConfig,
+        "whisper-eagle3-experimental-v1": Eagle3SpeculatorConfig,
+    }
+    if metadata["format"] not in formats:
         raise ValueError("Unsupported Whisper draft checkpoint format")
-    config = DFlashSpeculatorConfig.model_validate(metadata["draft_config"])
-    # HF config serialization omits the private attention setting. This
-    # experimental checkpoint format always uses eager attention.
+    config = formats[metadata["format"]].model_validate(metadata["draft_config"])
+    # HF serialization omits the private attention setting; restore the saved
+    # backend, with eager as the backwards-compatible default.
     config.transformer_layer_config._attn_implementation = metadata.get(  # noqa: SLF001
         "attention_implementation", "eager"
     )
-    draft = DFlashDraftModel(config)
+    draft = (
+        WhisperEagle3DraftModel(config, block_size=metadata["block_size"])
+        if isinstance(config, Eagle3SpeculatorConfig)
+        else DFlashDraftModel(config)
+    )
     draft.verifier_norm = torch.nn.LayerNorm(
         draft.hidden_size, eps=metadata["verifier_norm_eps"]
     )
     draft.load_state_dict(load_file(str(directory / "draft.safetensors")))
     for module in (
         draft.embed_tokens,
-        draft.lm_head,
         draft.verifier_lm_head,
         draft.verifier_norm,
     ):
         module.requires_grad_(False)
+    if isinstance(draft, DFlashDraftModel):
+        draft.lm_head.requires_grad_(False)
     return draft

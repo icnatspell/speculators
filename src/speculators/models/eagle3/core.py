@@ -1,4 +1,5 @@
 import copy
+from collections.abc import Callable
 from typing import ClassVar
 
 import torch
@@ -202,6 +203,7 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
         ttt_steps: int = 3,
         ttt_step_loss_decay: float = 1.0,
         loss_config: LossConfig | None = None,
+        logits_transform: Callable[[torch.Tensor], torch.Tensor] | None = None,
         **kwargs,
     ):
         device = hidden_states.device
@@ -251,6 +253,8 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                 targets = self.verifier_lm_head(
                     self.verifier_norm(verifier_last_hidden_states)
                 )
+                if logits_transform is not None:
+                    targets = logits_transform(targets)
                 # shape: [1, total_seq_len, draft_vocab_size]
             loss = torch.tensor(0.0, device=device)
 
@@ -304,6 +308,8 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                 logits = self.lm_head(hidden_states)
             else:
                 logits = self.lm_head(self.norm(hidden_states))
+            if logits_transform is not None:
+                logits = logits_transform(logits)
             # shape: [1, total_seq_len, draft_vocab_size]
 
             if return_loss:

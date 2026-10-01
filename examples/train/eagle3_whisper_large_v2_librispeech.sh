@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DFLASH recipe using the shared Whisper response/data/train/eval flow.
+# EAGLE3 recipe using the shared Whisper response/data/train/eval flow.
 set -euo pipefail
-export SPECULATOR_TYPE=dflash
+export SPECULATOR_TYPE=eagle3
 exec bash "$(dirname "${BASH_SOURCE[0]}")/whisper_librispeech_online.sh"

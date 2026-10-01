@@ -543,3 +543,17 @@ measure held-out MAL rather than extrapolating from these tiny smoke results.
 The GPU fused-loss/SDPA gradient regression and drafter-only autocast regression
 pass locally. Only one CUDA GPU is available, so the two-GPU integration gate
 remains a check for the larger machine.
+
+## Shared EAGLE-3 support
+
+The pipeline now also supports EAGLE-3 through `scripts/train_whisper_online.py
+--speculator-type eagle3` and `scripts/evaluate_whisper.py`. Existing DFlash
+Python/shell entry points remain compatibility wrappers with their prior
+defaults. The neutral shell workflows live in
+`examples/train/whisper_librispeech_online.sh` and
+`examples/train/whisper_tiny_en_librispeech_online.sh`.
+See [the EAGLE-3 guide](whisper_eagle3_online.md) for native rollout alignment,
+cached linear proposals, recipes, and smoke evidence. Responses, prepared data,
+and fixed evaluation sample caches can be shared between the two algorithms.
+The shared trainer now applies the documented DFlash anchor budget once per
+utterance, removing a duplicate batch-size multiplier.

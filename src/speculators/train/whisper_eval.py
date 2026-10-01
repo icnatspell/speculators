@@ -207,7 +207,10 @@ def validation_loss(
                 # Fixed anchors without disturbing the trainer's RNG sequence.
                 with torch.random.fork_rng():
                     torch.manual_seed(seed + batch_index * batch_size + index)
-                    with whisper_autocast(draft.embed_tokens.weight.device, dtype):
+                    with (
+                        whisper_autocast(draft.embed_tokens.weight.device, dtype),
+                        torch.compiler.set_stance("force_eager"),
+                    ):
                         _, metrics = whisper_draft_loss(
                             draft,
                             features_row,

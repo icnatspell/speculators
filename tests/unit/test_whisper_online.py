@@ -107,9 +107,10 @@ def test_eal_pools_rounds_and_includes_bonus():
     assert metrics["acceptance_by_position"] == [0.25] * 3
 
 
+@pytest.mark.parametrize("algorithm", ["dflash", "eagle3"])
 @pytest.mark.parametrize(("batch_size", "accumulation"), [(1, 1), (2, 2)])
 def test_online_training_resume_matches_uninterrupted(
-    tmp_path, batch_size, accumulation
+    tmp_path, batch_size, accumulation, algorithm
 ):
     root = Path(__file__).resolve().parents[2]
     env = {
@@ -120,6 +121,8 @@ def test_online_training_resume_matches_uninterrupted(
     command = [
         sys.executable,
         str(root / "scripts/train_whisper_dflash_online.py"),
+        "--speculator-type",
+        algorithm,
         "--synthetic",
         "--device",
         "cpu",

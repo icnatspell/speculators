@@ -1,4 +1,4 @@
-"""Experimental greedy Whisper/DFlash decoding for short audio, batch size one.
+"""Greedy Whisper verification for DFlash and EAGLE-3, short audio, batch size one.
 
 The audio encoder and cross-attention cache are reused. Rejected decoder tokens
 are removed from the self-attention cache and auxiliary-feature history.
@@ -16,6 +16,8 @@ from transformers.generation.logits_process import (
 )
 
 from speculators.models.dflash.core import DFlashDraftModel
+from speculators.models.eagle3.whisper import WhisperEagle3DraftModel
+from speculators.proposals.whisper_eagle3 import Eagle3WhisperProposal
 from speculators.proposals.whisper_profile import (
     WhisperGenerationTimer,
     WhisperStageTimer,
@@ -298,7 +300,7 @@ def greedy_whisper_decode(
 @torch.no_grad()
 def speculative_whisper_decode(  # noqa: C901
     teacher: WhisperForConditionalGeneration,
-    draft: DFlashDraftModel,
+    draft: DFlashDraftModel | WhisperEagle3DraftModel,
     audio: torch.Tensor,
     prompt: torch.Tensor,
     *,
@@ -311,16 +313,21 @@ def speculative_whisper_decode(  # noqa: C901
     measure_generation: bool = False,
     optimize_decode: bool = True,
     draft_dtype: torch.dtype | None = None,
+    candidate_proposer: Callable | None = None,
 ) -> WhisperDecodeResult:
     """Verify parallel proposals against causal Whisper greedy predictions.
 
-    Each round begins with a guaranteed teacher token (DFlash's anchor), then
+    Each round begins with a guaranteed teacher token (the anchor), then
     accepts only the contiguous matching draft prefix. The next round starts
     with the correction token on rejection, or a bonus token on full acceptance.
     """
     _validate_inputs(teacher, prompt, max_new_tokens)
     teacher.eval()
     draft.eval()
+    if candidate_proposer is None and isinstance(draft, WhisperEagle3DraftModel):
+        candidate_proposer = Eagle3WhisperProposal(
+            draft, cache_context=cache_draft_context
+        )
 
     def draft_autocast():
         if draft_dtype is None or draft_dtype == torch.float32:
@@ -359,10 +366,17 @@ def speculative_whisper_decode(  # noqa: C901
         eligible_by_position=[0] * (draft.block_size - 1),
     )
     limit = prompt.shape[1] + max_new_tokens
-    draft_cache = DFlashWhisperContextCache() if cache_draft_context else None
+    draft_cache = (
+        DFlashWhisperContextCache()
+        if cache_draft_context and candidate_proposer is None
+        else None
+    )
     if draft_cache is not None and proposal_fn is dflash_whisper_proposal:
         with timer.measure("draft_prefill"), draft_autocast():
             draft_cache.update(draft, context.to(draft.embed_tokens.weight.device))
+    if isinstance(candidate_proposer, Eagle3WhisperProposal):
+        with timer.measure("draft_prefill"), draft_autocast():
+            candidate_proposer.prefill(context, prefix)
     while prefix.shape[1] < limit:
         with timer.measure("selection"):
             anchor = selector.one(prefix, next_logits)
@@ -374,7 +388,16 @@ def speculative_whisper_decode(  # noqa: C901
             break
         generation_timer.begin()
         with timer.measure("draft"), draft_autocast():
-            if proposal_fn is dflash_whisper_proposal:
+            if candidate_proposer is not None:
+                candidates = candidate_proposer(
+                    context,
+                    prefix,
+                    anchor,
+                    budget=limit - prefix.shape[1],
+                    eos=teacher.config.eos_token_id,
+                    select_token=selector.one,
+                )
+            elif proposal_fn is dflash_whisper_proposal:
                 proposal_logits = proposal_fn(
                     draft,
                     context.to(draft.embed_tokens.weight.device),
@@ -383,16 +406,18 @@ def speculative_whisper_decode(  # noqa: C901
                 )
             else:
                 proposal_logits = proposal_fn(draft, context, anchor)
-            proposal_logits = proposal_logits.to(teacher.device)
+            if candidate_proposer is None:
+                proposal_logits = proposal_logits.to(teacher.device)
         with timer.measure("candidate_selection"):
-            candidates = _draft_candidates(
-                selector,
-                prefix,
-                anchor,
-                proposal_logits,
-                limit - prefix.shape[1],
-                eos=teacher.config.eos_token_id,
-            )
+            if candidate_proposer is None:
+                candidates = _draft_candidates(
+                    selector,
+                    prefix,
+                    anchor,
+                    proposal_logits,
+                    limit - prefix.shape[1],
+                    eos=teacher.config.eos_token_id,
+                )
         result.draft_rounds += 1
         result.proposed_tokens += candidates.shape[1] - 1
         for position in range(candidates.shape[1] - 1):
