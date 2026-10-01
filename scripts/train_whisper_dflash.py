@@ -135,9 +135,10 @@ def load_teacher_and_rows(args, metadata):
         dataset_sha = api.dataset_info(args.dataset, revision=args.dataset_revision).sha
         metadata.update(teacher_sha=model_sha, dataset_sha=dataset_sha)
         processor = WhisperProcessor.from_pretrained(args.teacher, revision=model_sha)
+        teacher_device = getattr(args, "teacher_device", None) or args.device
         teacher = WhisperForConditionalGeneration.from_pretrained(
             args.teacher, revision=model_sha
-        ).to(args.device)
+        ).to(teacher_device)
         rows = load_rows(args, args.split, dataset_sha)
     return teacher, processor, rows
 

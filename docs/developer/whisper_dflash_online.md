@@ -249,11 +249,28 @@ optimizer-step schedule cap. This keeps hidden states out of storage while
 allowing the training set to be revisited. `--max-samples` can cap that budget
 for a smoke run.
 
+Teacher feature extraction can run in a bounded producer thread while the
+drafter trains on the next sample. The full-data recipe selects the first two
+visible GPUs and enables a two-sample prefetch queue when at least two CUDA
+devices are available; otherwise it uses one GPU with prefetch disabled. Set
+`TEACHER_DEVICE` and `DRAFT_DEVICE` to override device selection. The queue
+holds only a small number of detached feature batches in memory; queued work is
+discarded and deterministically recomputed after resume. Speculative evaluation
+also supports keeping the verifier and drafter on separate devices.
+
 For a small end-to-end smoke run, use the tiny-teacher recipe and reduce its
 sample/step settings. The full Large-v2 command is:
 
 ```bash
 examples/train/dflash_whisper_large_v2_librispeech.sh
+```
+
+To explicitly select GPUs for concurrent teacher feature generation and draft
+optimization:
+
+```bash
+TEACHER_DEVICE=cuda:0 DRAFT_DEVICE=cuda:1 PREFETCH_SAMPLES=2 \
+  examples/train/dflash_whisper_large_v2_librispeech.sh
 ```
 
 The output directory contains the generation manifest and command, prepared

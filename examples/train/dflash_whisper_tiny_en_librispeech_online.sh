@@ -11,6 +11,9 @@ MAX_SAMPLES="${MAX_SAMPLES:-32}"
 EVAL_SAMPLES="${EVAL_SAMPLES:-8}"
 PREPROCESSING_WORKERS="${PREPROCESSING_WORKERS:-2}"
 TEACHER="${TEACHER:-openai/whisper-tiny.en}"
+TEACHER_DEVICE="${TEACHER_DEVICE:-cuda}"
+DRAFT_DEVICE="${DRAFT_DEVICE:-$TEACHER_DEVICE}"
+PREFETCH_SAMPLES="${PREFETCH_SAMPLES:-0}"
 SEQ_LENGTH="${SEQ_LENGTH:-448}"
 
 export PYTHONPATH="src:hs_connectors/src:scripts${PYTHONPATH:+:$PYTHONPATH}"
@@ -24,6 +27,7 @@ TRAIN_OUTPUT="$OUTPUT_DIR/training"
 echo "=== Step 1: Generate pinned greedy teacher responses ==="
 "$PYTHON" scripts/generate_whisper_responses.py \
     --teacher "$TEACHER" \
+    --device "$TEACHER_DEVICE" \
     --split train.clean.100 \
     --max-samples "$MAX_SAMPLES" \
     --max-new-tokens 192 \
@@ -49,7 +53,9 @@ echo "=== Step 3: Train the PyTorch drafter and evaluate EAL/speed ==="
     --response-manifest "$RESPONSE_FILE.manifest.json" \
     --split train.clean.100 \
     --eval-split validation.clean \
-    --device cuda \
+    --device "$DRAFT_DEVICE" \
+    --teacher-device "$TEACHER_DEVICE" \
+    --prefetch-samples "$PREFETCH_SAMPLES" \
     --steps "$STEPS" \
     --max-samples "$MAX_SAMPLES" \
     --max-new-tokens 192 \

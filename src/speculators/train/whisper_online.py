@@ -1,8 +1,10 @@
 """Restart state and metrics for bounded online Whisper distillation."""
 
 import math
+import queue
 import random
 import shutil
+import threading
 import unicodedata
 from itertools import chain
 
@@ -27,6 +29,54 @@ def shuffled_dataset_epochs(dataset, *, epochs, seed, buffer_size):
         )
         for epoch in range(epochs)
     )
+
+
+def prefetch_map(source, function, *, capacity):  # noqa: C901
+    """Map items in order, optionally using a bounded producer thread."""
+    if capacity < 0:
+        raise ValueError("Prefetch capacity cannot be negative")
+    if capacity == 0:
+        for item in source:
+            yield function(item)
+        return
+
+    output = queue.Queue(maxsize=capacity)
+    stopped = threading.Event()
+    finished = object()
+
+    def put(value):
+        while not stopped.is_set():
+            try:
+                output.put(value, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def produce():
+        try:
+            for item in source:
+                if not put(("item", function(item))):
+                    return
+        except Exception as error:  # noqa: BLE001 -- relay producer errors
+            put(("error", error))
+        finally:
+            put(finished)
+
+    worker = threading.Thread(target=produce, name="whisper-feature-prefetch")
+    worker.start()
+    try:
+        while True:
+            value = output.get()
+            if value is finished:
+                break
+            kind, payload = value
+            if kind == "error":
+                raise payload
+            yield payload
+    finally:
+        stopped.set()
+        worker.join()
 
 
 def normalize_transcript(text):

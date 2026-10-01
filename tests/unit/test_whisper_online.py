@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from speculators.train.whisper_online import (
     acceptance_metrics,
     corpus_error_rates,
     learning_rate_scale,
+    prefetch_map,
     shuffled_dataset_epochs,
 )
 
@@ -43,6 +45,34 @@ def test_reference_error_rates_normalize_case_and_punctuation():
     rates = corpus_error_rates(["Hello, world!", "One two"], ["hello world", "One too"])
     assert rates["wer"] == pytest.approx(1 / 4)
     assert rates["cer"] == pytest.approx(1 / 16)
+
+
+def test_prefetch_map_overlaps_production_and_preserves_order():
+    produced_second = threading.Event()
+
+    def prepare(item):
+        if item == 1:
+            produced_second.set()
+        return item * 2
+
+    items = prefetch_map(range(4), prepare, capacity=1)
+    try:
+        assert next(items) == 0
+        assert produced_second.wait(timeout=1)
+        assert list(items) == [2, 4, 6]
+    finally:
+        items.close()
+
+
+def test_prefetch_map_propagates_producer_errors():
+    def fail(item):
+        if item == 1:
+            raise ValueError("feature generation failed")
+        return item
+
+    items = prefetch_map(range(3), fail, capacity=1)
+    with pytest.raises(ValueError, match="feature generation failed"):
+        list(items)
 
 
 def test_eal_pools_rounds_and_includes_bonus():

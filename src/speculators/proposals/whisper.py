@@ -192,6 +192,9 @@ def _auxiliary(output, layer_ids):
 @torch.no_grad()
 def dflash_whisper_proposal(draft, context, anchor, *, context_cache=None):
     """Run one bidirectional query block conditioned on verified features."""
+    device = draft.embed_tokens.weight.device
+    context = context.to(device)
+    anchor = anchor.to(device)
     length = context.shape[1]
     query_ids = torch.full(
         (1, draft.block_size),
@@ -345,7 +348,7 @@ def speculative_whisper_decode(  # noqa: C901
     draft_cache = DFlashWhisperContextCache() if cache_draft_context else None
     if draft_cache is not None and proposal_fn is dflash_whisper_proposal:
         with timer.measure("draft_prefill"):
-            draft_cache.update(draft, context)
+            draft_cache.update(draft, context.to(draft.embed_tokens.weight.device))
     while prefix.shape[1] < limit:
         with timer.measure("selection"):
             anchor = selector.one(prefix, next_logits)
@@ -359,10 +362,14 @@ def speculative_whisper_decode(  # noqa: C901
         with timer.measure("draft"):
             if proposal_fn is dflash_whisper_proposal:
                 proposal_logits = proposal_fn(
-                    draft, context, anchor, context_cache=draft_cache
+                    draft,
+                    context.to(draft.embed_tokens.weight.device),
+                    anchor.to(draft.embed_tokens.weight.device),
+                    context_cache=draft_cache,
                 )
             else:
                 proposal_logits = proposal_fn(draft, context, anchor)
+            proposal_logits = proposal_logits.to(teacher.device)
         with timer.measure("candidate_selection"):
             candidates = _draft_candidates(
                 selector,

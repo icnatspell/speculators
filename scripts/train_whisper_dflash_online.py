@@ -37,6 +37,7 @@ from speculators.train.whisper_online import (
     acceptance_metrics,
     corpus_error_rates,
     learning_rate_scale,
+    prefetch_map,
     restore_rng,
     save_checkpoint,
     shuffled_dataset_epochs,
@@ -75,6 +76,22 @@ def parse_args():  # noqa: C901
     parser.add_argument("--max-anchors", type=int, default=32)
     parser.add_argument("--target-layer-ids", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument("--device", default="cuda")
+    parser.add_argument(
+        "--teacher-device",
+        help=(
+            "Teacher/feature GPU; defaults to --device. Use separate GPUs to "
+            "overlap work."
+        ),
+    )
+    parser.add_argument(
+        "--prefetch-samples",
+        type=int,
+        default=0,
+        help=(
+            "Bounded in-memory teacher-feature lookahead; 0 disables the "
+            "producer thread."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shuffle-buffer", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -119,6 +136,8 @@ def parse_args():  # noqa: C901
         parser.error("max-samples must be positive when provided")
     if args.epochs < 1:
         parser.error("epochs must be positive")
+    if args.prefetch_samples < 0:
+        parser.error("prefetch-samples cannot be negative")
     if (
         args.shuffle_buffer < 1
         or not 0 <= args.minimum_lr_ratio <= 1
@@ -135,6 +154,10 @@ def parse_args():  # noqa: C901
         parser.error("Training and evaluation splits must be unique")
     if args.synthetic and args.device != "cpu":
         parser.error("Synthetic runs use CPU")
+    if args.synthetic and args.teacher_device not in (None, "cpu"):
+        parser.error("Synthetic runs use the CPU teacher")
+    if args.synthetic and args.prefetch_samples:
+        parser.error("Synthetic runs do not support threaded prefetch")
     if not args.synthetic and args.train_data is None:
         parser.error("--train-data is required unless --synthetic is set")
     if not args.synthetic and args.response_manifest is None:
@@ -147,6 +170,16 @@ def parse_args():  # noqa: C901
 def append_json(path, record):
     with path.open("a") as handle:
         handle.write(json.dumps(record) + "\n")
+
+
+def device_identity(device):
+    device = torch.device(device)
+    if device.type == "cuda":
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        return device.type, index
+    return device.type, device.index
 
 
 @torch.no_grad()
@@ -185,6 +218,56 @@ def prepared_teacher_sample(row, processor, teacher):
     prompt_length = int(row["whisper_begin_index"])
     encoder = teacher.model.encoder(audio, return_dict=True)
     return audio, tokens, prompt_length, loss_mask, encoder
+
+
+def prepare_training_item(args, processor, teacher, adapter, row):
+    """Build one in-memory teacher feature item for the training consumer."""
+    sample_id = str(row) if args.synthetic else str(row.get("id", "unknown"))
+    feature_start = time.monotonic()
+    try:
+        if args.synthetic:
+            audio, prompt, encoder, tokens = teacher_response(
+                args, teacher, processor, row
+            )
+            prompt_length = prompt.shape[1]
+            loss_mask = None
+        else:
+            audio, tokens, prompt_length, loss_mask, encoder = prepared_teacher_sample(
+                row, processor, teacher
+            )
+    except UnsupportedAudioError:
+        return {"sample_id": sample_id, "skip": "long_audio"}
+
+    response_tokens = (
+        int(loss_mask.sum().item())
+        if loss_mask is not None
+        else tokens.shape[1] - prompt_length
+    )
+    if response_tokens <= args.block_size:
+        del audio, encoder, tokens
+        return {"sample_id": sample_id, "skip": "short_response"}
+    truncated = tokens[0, -1].item() != teacher.config.eos_token_id
+    features = adapter.extract(
+        audio,
+        tokens,
+        prompt_length=prompt_length,
+        loss_mask=loss_mask,
+        encoder_outputs=encoder,
+    )
+    if teacher.device.type == "cuda":
+        # The consumer may use another GPU and CUDA streams are thread-local.
+        # Finish the producer stream before publishing tensors to the queue.
+        torch.cuda.synchronize(teacher.device)
+    item = {
+        "sample_id": sample_id,
+        "speaker_id": None if args.synthetic else row.get("speaker_id"),
+        "response_tokens": response_tokens,
+        "truncated": truncated,
+        "teacher_feature_seconds": time.monotonic() - feature_start,
+        "features": features,
+    }
+    del audio, encoder, tokens
+    return item
 
 
 def collect_validation(args, teacher, processor, metadata):
@@ -376,74 +459,52 @@ def record_evaluation(args, report, metadata):
     append_json(args.output_dir / "eval_metrics.jsonl", report)
 
 
-def run_updates(  # noqa: C901
+def run_updates(
     args,
     teacher,
     processor,
     draft,
-    adapter,
     *,
     optimizer,
     scheduler,
-    rows,
+    items,
     samples,
     state,
     metadata,
     start,
     target,
 ):
-    for row in rows:
-        if state["step"] >= target or state["consumed"] >= args.max_samples:
-            break
-        state["consumed"] += 1
-        sample_id = (
-            str(row)
-            if args.synthetic
-            else str(row.get("id", f"sample-{state['consumed']}"))
-        )
+    item_iterator = iter(items)
+    while state["step"] < target and state["consumed"] < args.max_samples:
+        wait_start = time.monotonic()
         try:
-            if args.synthetic:
-                audio, prompt, encoder, tokens = teacher_response(
-                    args, teacher, processor, row
-                )
-                prompt_length = prompt.shape[1]
-                loss_mask = None
-            else:
-                audio, tokens, prompt_length, loss_mask, encoder = (
-                    prepared_teacher_sample(row, processor, teacher)
-                )
-                prompt = tokens[:, :prompt_length]
-        except UnsupportedAudioError:
-            state["skipped"]["long_audio"] += 1
+            item = next(item_iterator)
+        except StopIteration:
+            break
+        feature_queue_wait_seconds = time.monotonic() - wait_start
+        state["consumed"] += 1
+        sample_id = item["sample_id"]
+        if "skip" in item:
+            state["skipped"][item["skip"]] += 1
             append_json(
                 args.output_dir / "train_metrics.jsonl",
                 {
                     "sample_id": sample_id,
-                    "skip": "long_audio",
+                    "skip": item["skip"],
                     "consumed": state["consumed"],
                 },
             )
             continue
-        response_tokens = (
-            int(loss_mask.sum().item())
-            if loss_mask is not None
-            else tokens.shape[1] - prompt.shape[1]
-        )
-        if response_tokens <= args.block_size:
-            state["skipped"]["short_response"] += 1
-            del audio, prompt, encoder, tokens
-            continue
-        truncated = tokens[0, -1].item() != teacher.config.eos_token_id
+        features = {
+            key: value.to(draft.embed_tokens.weight.device)
+            for key, value in item["features"].items()
+        }
+        response_tokens = item["response_tokens"]
+        truncated = item["truncated"]
         state["truncated_responses"] += int(truncated)
-        features = adapter.extract(
-            audio,
-            tokens,
-            prompt_length=prompt_length,
-            loss_mask=loss_mask,
-            encoder_outputs=encoder,
-        )
         lr = optimizer.param_groups[0]["lr"]
         training_metrics = {}
+        update_start = time.monotonic()
         loss = train_whisper_step(
             draft,
             optimizer,
@@ -451,6 +512,7 @@ def run_updates(  # noqa: C901
             max_anchors=args.max_anchors,
             metrics_sink=training_metrics,
         )
+        draft_update_seconds = time.monotonic() - update_start
         for key, value in training_metrics.items():
             state["training_counts"][key] = (
                 state["training_counts"].get(key, 0.0) + value
@@ -460,22 +522,27 @@ def run_updates(  # noqa: C901
         record = {
             "step": state["step"],
             "sample_id": sample_id,
-            "speaker_id": None if args.synthetic else row.get("speaker_id"),
+            "speaker_id": item["speaker_id"],
             "loss": loss,
             "training_metrics": training_metrics,
             "train_eal": training_metrics["eal_sum"] / training_metrics["eal_total"],
             "learning_rate": lr,
             "response_tokens": response_tokens,
+            "teacher_feature_seconds": item["teacher_feature_seconds"],
+            "feature_queue_wait_seconds": feature_queue_wait_seconds,
+            "draft_update_seconds": draft_update_seconds,
             "truncated": truncated,
             "consumed": state["consumed"],
             "elapsed_seconds": time.monotonic() - start,
-            "cuda_allocated_bytes": torch.cuda.memory_allocated()
-            if teacher.device.type == "cuda"
-            else 0,
+            "cuda_allocated_bytes": sum(
+                torch.cuda.memory_allocated(device)
+                for device in {teacher.device, draft.embed_tokens.weight.device}
+                if device.type == "cuda"
+            ),
             "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         }
         append_json(args.output_dir / "train_metrics.jsonl", record)
-        del audio, prompt, encoder, tokens, features
+        del features
         if state["step"] % 25 == 0:
             atomic_write(
                 args.output_dir / "progress.json",
@@ -558,6 +625,9 @@ def main():  # noqa: C901
     args = parse_args()
     if args.synthetic and args.max_samples is None:
         args.max_samples = 10000
+    args.teacher_device = args.teacher_device or args.device
+    if args.synthetic:
+        args.teacher_device = "cpu"
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     if args.synthetic:
@@ -579,10 +649,17 @@ def main():  # noqa: C901
     metadata["training_policy"] = (
         "prepared_greedy_teacher_responses_online_teacher_features"
     )
+    metadata["teacher_device"] = args.teacher_device
     args.split = list(args.split)
     metadata["split"] = args.split
     args.split = args.split[0]
     teacher, processor, source_rows = load_teacher_and_rows(args, metadata)
+    if args.prefetch_samples and device_identity(teacher.device) == device_identity(
+        args.device
+    ):
+        raise ValueError(
+            "Feature prefetch requires distinct teacher and drafter devices"
+        )
     if args.synthetic:
         rows = source_rows
     else:
@@ -634,11 +711,11 @@ def main():  # noqa: C901
     adapter = WhisperFeatureAdapter(teacher, args.target_layer_ids)
     latest = args.output_dir / "latest"
     draft = (
-        load_whisper_draft(latest).to(teacher.device)
+        load_whisper_draft(latest).to(args.device)
         if args.resume
         else build_whisper_draft(
             teacher, args.target_layer_ids, block_size=args.block_size
-        )
+        ).to(args.device)
     )
     optimizer = torch.optim.AdamW(
         [parameter for parameter in draft.parameters() if parameter.requires_grad],
@@ -665,14 +742,14 @@ def main():  # noqa: C901
     saved = None
     if args.resume:
         saved, state = load_resume(
-            latest, metadata, teacher.device, optimizer, scheduler, state
+            latest, metadata, args.device, optimizer, scheduler, state
         )
     print("Collecting fixed held-out teacher responses...", flush=True)
     samples = collect_validation(args, teacher, processor, metadata)
     metadata["validation_ids"] = [sample["id"] for sample in samples]
     atomic_write(args.output_dir / "run_config.json", json.dumps(metadata, indent=2))
     start = time.monotonic()
-    with nullcontext(rows) if args.synthetic else closing(rows):
+    with nullcontext(rows):
         if saved:
             # Replay the deterministic shuffled stream to recover its exact position.
             replayed = sum(1 for _ in islice(rows, state["consumed"]))
@@ -692,29 +769,36 @@ def main():  # noqa: C901
                 flush=True,
             )
         target = args.stop_after or args.steps
-        run_updates(
-            args,
-            teacher,
-            processor,
-            draft,
-            adapter,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            rows=rows,
-            samples=samples,
-            state=state,
-            metadata=metadata,
-            start=start,
-            target=target,
+        items = prefetch_map(
+            rows,
+            partial(prepare_training_item, args, processor, teacher, adapter),
+            capacity=args.prefetch_samples,
         )
+        with closing(items):
+            run_updates(
+                args,
+                teacher,
+                processor,
+                draft,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                items=items,
+                samples=samples,
+                state=state,
+                metadata=metadata,
+                start=start,
+                target=target,
+            )
         snapshot(args, draft, optimizer, scheduler, state, metadata, "latest")
     outcome = {
         **metadata,
         **state,
         "elapsed_seconds": time.monotonic() - start,
-        "peak_cuda_bytes": torch.cuda.max_memory_allocated()
-        if teacher.device.type == "cuda"
-        else 0,
+        "peak_cuda_bytes": sum(
+            torch.cuda.max_memory_allocated(device)
+            for device in {teacher.device, draft.embed_tokens.weight.device}
+            if device.type == "cuda"
+        ),
         "peak_rss_kib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         "status": "complete" if state["step"] == args.steps else "stopped",
     }

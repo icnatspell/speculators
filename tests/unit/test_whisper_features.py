@@ -160,6 +160,27 @@ def test_speculative_decode_matches_greedy_with_real_draft(budget):
     assert torch.equal(actual.tokens, baseline.tokens)
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+def test_speculative_decode_supports_teacher_and_draft_on_separate_gpus():
+    teacher = tiny_teacher().to("cuda:0").eval()
+    draft = build_whisper_draft(teacher, [0, 1]).to("cuda:1")
+    audio = torch.randn(1, 4, 16, device="cuda:0")
+    prompt = torch.tensor([[1, 3]], device="cuda:0")
+    baseline = greedy_whisper_decode(
+        teacher, audio, prompt, max_new_tokens=7, processors=LogitsProcessorList()
+    )
+    actual = speculative_whisper_decode(
+        teacher,
+        draft,
+        audio,
+        prompt,
+        max_new_tokens=7,
+        processors=LogitsProcessorList(),
+        cache_draft_context=True,
+    )
+    assert torch.equal(actual.tokens.cpu(), baseline.tokens.cpu())
+
+
 @pytest.mark.parametrize("proposal_token", [0, 1])
 def test_forced_acceptance_and_rejection(proposal_token):
     teacher = tiny_teacher().eval()
