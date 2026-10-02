@@ -557,3 +557,19 @@ cached linear proposals, recipes, and smoke evidence. Responses, prepared data,
 and fixed evaluation sample caches can be shared between the two algorithms.
 The shared trainer now applies the documented DFlash anchor budget once per
 utterance, removing a duplicate batch-size multiplier.
+
+### Audio identity and accumulation
+
+New response rows include `audio_sha256`. Preparation preserves this field, and
+training verifies the recording bytes before decoding them, including recordings
+remapped with `--audio-root`. Generation resume verifies already-written rows;
+existing audio files with different source contents are rejected. Older response
+corpora without hashes must be regenerated into a fresh output directory and
+prepared again. Hashing an existing corpus cannot establish that its recordings
+are the ones originally used to generate its responses.
+
+Optimizer updates weight microbatches by their supervised target counts. The
+normalization includes only microbatches that produced features and handles a
+partial final accumulation group. Checkpoints record
+`accumulation_policy=supervised-target-weighted-v1`; resuming a checkpoint created
+with the earlier averaging policy is rejected to preserve exact resume semantics.

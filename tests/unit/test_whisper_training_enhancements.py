@@ -1,7 +1,10 @@
 """Regression gates for batched online training, terminal targets and isolation."""
 
+import hashlib
+
 import pytest
 import torch
+from generate_whisper_responses import _write_audio
 
 from speculators.data_generation.whisper import WhisperFeatureAdapter
 from speculators.proposals.whisper import (
@@ -22,6 +25,7 @@ from speculators.train.whisper_runtime import (
     pack_whisper_features,
     recover_checkpoint,
     repair_jsonl_tail,
+    verified_audio_bytes,
 )
 from tests.unit.test_whisper_features import tiny_teacher
 
@@ -368,3 +372,51 @@ def test_evaluation_requires_explicit_opt_in_for_token_drift(monkeypatch):
     assert not report["all_tokens_match"]
     assert report["token_match_rate"] == 0
     assert not report["samples"][0]["tokens_match"]
+
+
+def test_audio_hash_rejects_replaced_and_unbound_recordings(tmp_path):
+    path = tmp_path / "one.flac"
+    original = b"original recording"
+    path.write_bytes(original)
+    row = {
+        "audio_relative_path": path.name,
+        "audio_sha256": hashlib.sha256(original).hexdigest(),
+    }
+    assert verified_audio_bytes(row, tmp_path) == original
+    path.write_bytes(b"different recording")
+    with pytest.raises(ValueError, match="Audio SHA256 mismatch"):
+        verified_audio_bytes(row, tmp_path)
+    row.pop("audio_sha256")
+    with pytest.raises(ValueError, match="Audio SHA256 missing"):
+        verified_audio_bytes(row, tmp_path)
+
+
+def test_generation_rejects_stale_existing_audio(tmp_path):
+    row = {"id": "one", "audio": {"bytes": b"original"}}
+    _write_audio(row, tmp_path)
+    _write_audio(row, tmp_path)
+    row["audio"]["bytes"] = b"changed"
+    with pytest.raises(ValueError, match="Existing audio content differs"):
+        _write_audio(row, tmp_path)
+
+
+@pytest.mark.parametrize("algorithm", ["dflash", "eagle3"])
+def test_training_gradients_condition_on_audio_with_identical_tokens(algorithm):
+    torch.manual_seed(42)
+    teacher = tiny_teacher()
+    adapter = WhisperFeatureAdapter(teacher, [0, 1, 2])
+    tokens = torch.tensor([1, 3, 4, 5, 6, 2])
+    audio = torch.randn(2, 4, 16)
+    rows = adapter.extract_batch(audio, [tokens, tokens], prompt_lengths=[2, 2])
+    assert not torch.equal(rows[0]["hidden_states"], rows[1]["hidden_states"])
+    draft = build_whisper_draft(teacher, [0, 1, 2], algorithm=algorithm)
+    gradients = []
+    for row in rows:
+        draft.zero_grad(set_to_none=True)
+        torch.manual_seed(123)  # hold DFlash anchor selection constant
+        with torch.compiler.set_stance("force_eager"):
+            loss, _ = whisper_draft_loss(draft, row, max_anchors=4)
+        loss.backward()
+        gradients.append(draft.fc.weight.grad.detach().clone())
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert not torch.equal(*gradients)

@@ -1,6 +1,7 @@
 """Batched, resumable pinned teacher responses; hidden states stay ephemeral."""
 
 import argparse
+import hashlib
 import json
 import time
 from collections import Counter, defaultdict
@@ -20,6 +21,7 @@ from speculators.train.whisper_eval import audio_duration, load_rows
 from speculators.train.whisper_runtime import (
     hash_file,
     repair_jsonl_tail,
+    verified_audio_bytes,
     write_provenance,
 )
 
@@ -93,6 +95,8 @@ def _write_audio(row, audio_dir):
         data = audio["bytes"]
     audio_dir.mkdir(parents=True, exist_ok=True)
     path = audio_dir / (str(row["id"]).replace("/", "_") + ".flac")
+    if path.exists() and hash_file(path) != hashlib.sha256(data).hexdigest():
+        raise ValueError(f"Existing audio content differs from source: {path}")
     if not path.exists():
         temporary = path.with_suffix(".pending")
         temporary.write_bytes(data)
@@ -163,6 +167,10 @@ def main():  # noqa: C901
         "teacher_attention": args.teacher_attention,
         "batch_size": args.batch_size,
     }
+    if args.resume and args.output_file.exists():
+        with args.output_file.open() as source:
+            for line in source:
+                verified_audio_bytes(json.loads(line), args.audio_dir)
     previous = (
         json.loads(manifest_path.read_text())
         if args.resume and manifest_path.exists()
@@ -265,6 +273,7 @@ def main():  # noqa: C901
                         "loss_mask": [0] * len(prompt_ids) + [1] * count,
                         "audio_url": uri,
                         "audio_relative_path": Path(uri).name,
+                        "audio_sha256": hash_file(args.audio_dir / Path(uri).name),
                         "whisper_begin_index": len(prompt_ids),
                         "source_split": split,
                         "reference_text": row.get("text", ""),

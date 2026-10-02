@@ -219,6 +219,7 @@ def test_audio_training_metadata_survives_prepare_data():
     row = {
         "input_ids": [[1, 2, 3, 4]],
         "loss_mask": [[0, 0, 1, 1]],
+        "audio_sha256": ["a" * 64],
         "audio_url": ["file:///tmp/example.flac"],
         "whisper_begin_index": [2],
         "id": ["chapter-123-0001"],
@@ -235,6 +236,7 @@ def test_audio_training_metadata_survives_prepare_data():
         render_endpoint=None,
     )
     for field in (
+        "audio_sha256",
         "audio_url",
         "whisper_begin_index",
         "id",

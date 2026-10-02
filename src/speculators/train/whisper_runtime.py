@@ -99,6 +99,18 @@ def audio_path(row, audio_root=None):
     return Path(unquote(parsed.path))
 
 
+def verified_audio_bytes(row, audio_root=None):
+    """Verify and return the exact recording bound to a prepared token row."""
+    expected = row.get("audio_sha256")
+    if not expected:
+        raise ValueError("Audio SHA256 missing; regenerate responses and prepare-data")
+    path = audio_path(row, audio_root)
+    data = path.read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected:
+        raise ValueError(f"Audio SHA256 mismatch: {path}")
+    return data
+
+
 def batched_rows(rows, batch_size, *, bucket_buffer=0):
     """Bounded token-length buckets; deterministic and replayable by batch count."""
     from itertools import islice  # noqa: PLC0415

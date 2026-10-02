@@ -472,6 +472,7 @@ def _passthrough_pretokenized(
             "audio_url",
             "whisper_begin_index",
             "audio_relative_path",
+            "audio_sha256",
             "id",
             "speaker_id",
             "chapter_id",

@@ -46,13 +46,13 @@ from speculators.train.whisper_online import (
     shuffled_dataset_epochs,
 )
 from speculators.train.whisper_runtime import (
-    audio_path,
     batched_rows,
     dataset_identity,
     hash_file,
     pack_whisper_features,
     precision_dtype,
     recover_checkpoint,
+    verified_audio_bytes,
 )
 
 
@@ -319,7 +319,12 @@ def teacher_response(args, teacher, processor, row):
 def load_prepared_audio(args, processor, row):
     try:
         audio = audio_features(
-            {"audio": {"bytes": None, "path": str(audio_path(row, args.audio_root))}},
+            {
+                "audio": {
+                    "bytes": verified_audio_bytes(row, args.audio_root),
+                    "path": None,
+                }
+            },
             processor,
             "cpu",
         )
@@ -575,6 +580,15 @@ def run_updates(  # noqa: C901 -- optimizer, logging and isolated validation loo
     train_time = state.get("training_seconds", 0.0)
     while state["step"] < target and not exhausted:
         group = []
+        target_count = torch.zeros((), device=args.device)
+        # A fixed bound keeps scaled backward magnitudes small in FP16.
+        target_bound = (
+            args.gradient_accumulation_steps
+            * args.batch_size
+            * max(
+                teacher.config.max_target_positions, args.max_anchors * args.block_size
+            )
+        )
         queue_wait = update_seconds = 0.0
         draft.train()
         optimizer.zero_grad(set_to_none=True)
@@ -612,7 +626,9 @@ def run_updates(  # noqa: C901 -- optimizer, logging and isolated validation loo
             ):
                 loss, metrics = function(features)
             # clip_grad_norm_ checks finiteness once per optimizer update.
-            scaler.scale(loss / args.gradient_accumulation_steps).backward()
+            count = metrics["weighted_loss_total"].detach()
+            scaler.scale(loss * (count / target_bound)).backward()
+            target_count += count
             for key, value in metrics.items():
                 totals[key] = totals.get(key, 0) + value.detach()
             del features, loss, metrics
@@ -625,11 +641,9 @@ def run_updates(  # noqa: C901 -- optimizer, logging and isolated validation loo
             continue
         update_start = time.monotonic()
         scaler.unscale_(optimizer)
-        if len(group) != args.gradient_accumulation_steps:
-            # Correct the last partial accumulation group after exhausting data.
-            for parameter in parameters:
-                if parameter.grad is not None:
-                    parameter.grad.mul_(args.gradient_accumulation_steps / len(group))
+        for parameter in parameters:
+            if parameter.grad is not None:
+                parameter.grad.mul_(target_bound / target_count.clamp_min(1))
         torch.nn.utils.clip_grad_norm_(
             parameters, max_norm=1.0, error_if_nonfinite=True
         )
@@ -895,6 +909,7 @@ def main(*, default_algorithm="dflash"):  # noqa: C901
         teacher_revision=args.teacher_revision,
         target_layer_ids=args.target_layer_ids,
         training_policy="prepared_greedy_teacher_responses_online_teacher_features",
+        accumulation_policy="supervised-target-weighted-v1",
     )
     if args.prefetch_samples and device_identity(teacher.device) == device_identity(
         args.device
@@ -925,6 +940,7 @@ def main(*, default_algorithm="dflash"):  # noqa: C901
             "input_ids",
             "loss_mask",
             "audio_url",
+            "audio_sha256",
             "whisper_begin_index",
             "source_split",
             "id",
